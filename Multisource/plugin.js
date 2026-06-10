@@ -621,11 +621,11 @@
 					for (var j = 0; j < src.streams.length; j++) {
 						var s = src.streams[j];
 						// Build minimal stream object — only fields the player needs
-						var obj = {
-							url: s.url,
-							source: src.source,
-							quality: s.quality || "",
-						};
+						var obj = { url: s.url, source: src.source };
+						// Only add quality/resolution when source provides a real one
+						if (s.quality && s.quality !== "") {
+							obj.quality = s.quality;
+						}
 						// Only add headers if they exist and aren't empty
 						if (
 							s.headers &&

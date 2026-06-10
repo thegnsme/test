@@ -88,7 +88,7 @@ async function scrapeStreams(params) {
 			if (s && s.url) {
 				streams.push({
 					url: s.url,
-					quality: s.quality || "Auto",
+					quality: s.quality || "",
 					headers: { "User-Agent": UA, Referer: "https://videasy.to/" },
 					subtitles: subs.length > 0 ? subs : undefined,
 				});

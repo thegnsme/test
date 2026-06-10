@@ -88,7 +88,6 @@ async function scrapeStreams(params) {
 			streams: [
 				{
 					url: playlistUrl,
-					quality: "Auto",
 					headers: {
 						"User-Agent": UA,
 						Referer: "https://vidlink.pro/",

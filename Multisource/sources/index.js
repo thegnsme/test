@@ -6,9 +6,8 @@
 
 var vidlinkPro = require("./vidlink_pro");
 var videasyTo = require("./videasy_to");
-var testStream = require("./test_stream");
 
-var SOURCES = [vidlinkPro, videasyTo, testStream];
+var SOURCES = [vidlinkPro, videasyTo];
 var SOURCE_TIMEOUT = 30000;
 
 function listSources() {
