@@ -125,8 +125,8 @@ async function scrapeStreams(params) {
 			if (sub.url) {
 				subtitles.push({
 					url: sub.url,
+					label: "VTT",
 					lang: sub.language || sub.lang || "unknown",
-					type: "vtt",
 				});
 			}
 		}

@@ -44,7 +44,7 @@
  *        resolution: string, // e.g. "1920x1080"
  *        headers?: object,
  *      }>,
- *      subtitles?: Array<{ url, lang, type }>,
+ *      subtitles?: Array<{ url, label, lang }>,
  *      error?: string,
  *      latency_ms: number,
  *    }

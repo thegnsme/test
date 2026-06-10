@@ -107,8 +107,11 @@ async function scrapeStreams(params) {
 				if (subUrl) {
 					captions.push({
 						url: subUrl,
+						label:
+							subUrl.indexOf(".vtt") !== -1
+								? "VTT"
+								: (c.type || "SRT").toUpperCase(),
 						lang: c.language || c.label || "unknown",
-						type: subUrl.indexOf(".vtt") !== -1 ? "vtt" : c.type || "srt",
 					});
 				}
 			}

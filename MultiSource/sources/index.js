@@ -17,6 +17,7 @@
  *  SOURCE CONTRACT:
  *    scrapeStreams({ tmdbId, type, season, episode })
  *      → { source, embedUrl, status, streams[], subtitles?, latency_ms }
+ *      subtitles[]: { url, label, lang }  (label = "VTT", "SRT", etc.)
  * =============================================================================
  */
 

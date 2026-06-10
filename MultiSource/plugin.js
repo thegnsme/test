@@ -622,6 +622,7 @@
 						var s = src.streams[j];
 						all.push({
 							url: s.url,
+							quality: s.quality || "",
 							source: src.source + (s.quality ? " [" + s.quality + "]" : ""),
 							headers: s.headers || {},
 						});
@@ -629,9 +630,19 @@
 				}
 
 				// Attach subtitles to all streams if available
+				// Normalize: sources return { url, lang, type } but spec requires { url, label, lang }
 				if (aggregated.subtitles && aggregated.subtitles.length) {
-					for (var si = 0; si < all.length; si++) {
-						all[si].subtitles = aggregated.subtitles;
+					var normalSubs = [];
+					for (var si = 0; si < aggregated.subtitles.length; si++) {
+						var sub = aggregated.subtitles[si];
+						normalSubs.push({
+							url: sub.url,
+							label: sub.type || sub.label || sub.lang || "unknown",
+							lang: sub.lang || "en",
+						});
+					}
+					for (var si2 = 0; si2 < all.length; si2++) {
+						all[si2].subtitles = normalSubs;
 					}
 				}
 
