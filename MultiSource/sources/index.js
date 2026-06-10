@@ -27,14 +27,12 @@
 // Each source must export: { name: string, scrapeStreams: function }
 
 var vidlinkPro = require("./vidlink_pro");
-var videasyNet = require("./videasy_net");
-var smashyStream = require("./smashystream");
-var vidsrcIcu = require("./vidsrc_icu");
-var vidsrcTo = require("./vidsrc_to");
+var videasyTo = require("./videasy_to");
+var lordflixOrg = require("./lordflix_org");
 
 // ── Source registry — add/remove sources here ───────────────────────────────
 
-var SOURCES = [vidlinkPro, videasyNet, smashyStream, vidsrcIcu, vidsrcTo];
+var SOURCES = [vidlinkPro, videasyTo, lordflixOrg];
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
