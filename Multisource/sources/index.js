@@ -1,22 +1,32 @@
 /**
- * SOURCES BARREL — loads all sources, runs them in parallel, aggregates results.
- * Each source returns streams that already have quality, headers, and subtitles.
+ * SOURCES BARREL — Add/remove sources here, nothing else to touch.
+ *
+ * TO ADD A SOURCE:
+ *   1. Create file.js that exports { name, scrapeStreams }
+ *   2. Add ONE line below:   sourceName: require("./file")
+ *      (The key is what shows in the stream list)
+ *
+ * TO REMOVE A SOURCE:
+ *   1. Delete the file
+ *   2. Delete its ONE line below
+ *
+ * That's it. plugin.js and _shared.js never need changes.
  */
 "use strict";
 
-var vidlinkPro = require("./vidlink_pro");
-var videasyTo = require("./videasy_to");
+var SOURCES_REGISTRY = {
+	"vidlink.pro": require("./vidlink_pro"),
+	"videasy.to": require("./videasy_to"),
+	// ── Add new sources above this line ──
+};
 
-var SOURCES = [vidlinkPro, videasyTo];
 var SOURCE_TIMEOUT = 30000;
 
 function listSources() {
-	var names = [];
-	for (var i = 0; i < SOURCES.length; i++) names.push(SOURCES[i].name);
-	return names;
+	return Object.keys(SOURCES_REGISTRY);
 }
 
-var sourceCount = SOURCES.length;
+var sourceCount = Object.keys(SOURCES_REGISTRY).length;
 
 async function aggregateAll(tmdbId, type, season, episode) {
 	var start = Date.now();
@@ -27,8 +37,10 @@ async function aggregateAll(tmdbId, type, season, episode) {
 		episode: parseInt(episode, 10) || 1,
 	};
 
+	var names = Object.keys(SOURCES_REGISTRY);
 	var results = await Promise.allSettled(
-		SOURCES.map(function (src) {
+		names.map(function (name) {
+			var src = SOURCES_REGISTRY[name];
 			var timeoutPromise = new Promise(function (_, reject) {
 				setTimeout(function () {
 					reject(new Error("timeout after " + SOURCE_TIMEOUT + "ms"));
@@ -41,7 +53,7 @@ async function aggregateAll(tmdbId, type, season, episode) {
 					})
 					.catch(function (err) {
 						return {
-							source: src.name,
+							source: name,
 							status: "error",
 							error: err.message,
 							streams: [],
@@ -51,7 +63,7 @@ async function aggregateAll(tmdbId, type, season, episode) {
 				timeoutPromise,
 			]).catch(function (err) {
 				return {
-					source: src.name,
+					source: name,
 					status: "error",
 					error: err.message || "timeout",
 					streams: [],
@@ -66,11 +78,11 @@ async function aggregateAll(tmdbId, type, season, episode) {
 		var r = results[i];
 		if (r.status === "fulfilled") {
 			var val = r.value;
-			if (!val.source) val.source = SOURCES[i].name;
+			if (!val.source) val.source = names[i];
 			sourcesOut.push(val);
 		} else {
 			sourcesOut.push({
-				source: SOURCES[i].name,
+				source: names[i],
 				status: "error",
 				error: (r.reason && r.reason.message) || "unknown",
 				streams: [],
@@ -79,7 +91,6 @@ async function aggregateAll(tmdbId, type, season, episode) {
 		}
 	}
 
-	// Count working sources
 	var working = 0;
 	for (var w = 0; w < sourcesOut.length; w++) {
 		if (
@@ -90,15 +101,12 @@ async function aggregateAll(tmdbId, type, season, episode) {
 			working++;
 	}
 
-	// Collect unique stream URLs
 	var allUrls = [];
 	for (var u = 0; u < sourcesOut.length; u++) {
 		var srcStreams = sourcesOut[u].streams || [];
 		for (var v = 0; v < srcStreams.length; v++) allUrls.push(srcStreams[v].url);
 	}
-	var uniqUrls = new Set(allUrls);
 
-	// Sort: working first
 	var STATUS_ORDER = {
 		working: 0,
 		no_streams: 1,
@@ -115,8 +123,8 @@ async function aggregateAll(tmdbId, type, season, episode) {
 		tmdbId: parseInt(tmdbId, 10),
 		type: type,
 		workingSources: working,
-		totalSources: SOURCES.length,
-		totalStreams: uniqUrls.size,
+		totalSources: names.length,
+		totalStreams: new Set(allUrls).size,
 		elapsed_ms: Date.now() - start,
 		sources: sourcesOut,
 	};
