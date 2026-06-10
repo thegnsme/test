@@ -578,7 +578,37 @@
 	//  Calls ALL sources in parallel, aggregates streams, passes through
 	//  each stream object with only: url, source, quality, headers, subtitles.
 	//  No StreamResult constructor — plain objects only.
+	//
+	//  Quality auto-detection: if a source doesn't provide a quality label,
+	//  the URL is scanned for resolution hints (1080p, 720p, etc.).
 	//  =========================================================================
+
+	/**
+	 * Extract resolution/quality from a URL when the source doesn't provide it.
+	 * Matches patterns like: 1080p, 720p, 4K, quality=1080, /1080/, _1080p_
+	 */
+	function extractQualityFromUrl(url) {
+		var u = String(url || "");
+		// Direct resolution labels (most common)
+		var m = u.match(/(2160p|1440p|1080p|720p|480p|360p|240p)/i);
+		if (m) return m[1].toLowerCase();
+		// 4K / 2K
+		if (/\b4k\b/i.test(u)) return "4K";
+		if (/\b2k\b/i.test(u)) return "2K";
+		// Query params: quality=1080, q=1080, res=1080
+		m = u.match(/[?&](?:quality|q|res)=(\d+)/i);
+		if (m) {
+			var n = parseInt(m[1], 10);
+			if (n >= 2160) return "2160p";
+			if (n >= 1440) return "1440p";
+			if (n >= 1080) return "1080p";
+			if (n >= 720) return "720p";
+			if (n >= 480) return "480p";
+			if (n >= 360) return "360p";
+			return m[1] + "p";
+		}
+		return "";
+	}
 
 	function loadStreams(url, cb) {
 		log("loadStreams(" + url + ")");
@@ -622,9 +652,10 @@
 						var s = src.streams[j];
 						// Build minimal stream object — only fields the player needs
 						var obj = { url: s.url, source: src.source };
-						// Only add quality/resolution when source provides a real one
-						if (s.quality && s.quality !== "") {
-							obj.quality = s.quality;
+						// Quality: use source-provided label, or auto-detect from URL
+						var q = s.quality || extractQualityFromUrl(s.url);
+						if (q && q !== "") {
+							obj.quality = q;
 						}
 						// Only add headers if they exist and aren't empty
 						if (
