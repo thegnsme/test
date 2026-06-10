@@ -1,15 +1,8 @@
 /**
- * =============================================================================
- *  SOURCE: test-stream — MINIMAL HLS diagnostic
- *  =============================================================================
- *  Returns a SINGLE stream with ONLY url and no extra fields.
- *  Matches the official SkyStream plugin example as closely as possible.
- *
- *  If even this fails to play, the issue is NOT about CDNs, Cloudflare,
- *  or URL format — it's a fundamental player or plugin configuration issue.
- * =============================================================================
+ * test-stream — diagnostic source
+ * Returns the official SkyStream test M3U8 with quality label.
+ * No headers, no subtitles — pure minimal stream object.
  */
-
 var SOURCE_NAME = "test-stream";
 var TEST_URL = "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8";
 
@@ -20,6 +13,7 @@ async function scrapeStreams(params) {
 		streams: [
 			{
 				url: TEST_URL,
+				quality: "Test",
 			},
 		],
 		latency_ms: 0,

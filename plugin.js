@@ -575,9 +575,9 @@
 	// ╔════════════════════════════════════════════════════════════════════════╗
 	// ║  CORE FUNCTION: loadStreams(url, cb)                                 ║
 	// ╚════════════════════════════════════════════════════════════════════════╝
-	//  Calls ALL sources in parallel and aggregates streams.
-	//  The sources barrel (sources/index.js) handles parallel execution with
-	//  per-source timeouts, deduplication, and subtitles.
+	//  Calls ALL sources in parallel, aggregates streams, passes through
+	//  each stream object with only: url, source, quality, headers, subtitles.
+	//  No StreamResult constructor — plain objects only.
 	//  =========================================================================
 
 	function loadStreams(url, cb) {
@@ -594,7 +594,7 @@
 
 		var param = {
 			tmdbId: parseInt(parsed.id, 10),
-			type: parsed.api, // "movie" or "tv"
+			type: parsed.api,
 			season: parsed.s || 1,
 			episode: parsed.e || 1,
 		};
@@ -615,65 +615,30 @@
 				}
 
 				var all = [];
-				var normalSubs;
-				if (aggregated.subtitles && aggregated.subtitles.length) {
-					normalSubs = [];
-					for (var si = 0; si < aggregated.subtitles.length; si++) {
-						var sub = aggregated.subtitles[si];
-						normalSubs.push({
-							url: sub.url,
-							label: sub.type || sub.label || sub.lang || "unknown",
-							lang: sub.lang || "en",
-						});
-					}
-				}
-
 				for (var i = 0; i < aggregated.sources.length; i++) {
 					var src = aggregated.sources[i];
 					if (src.status !== "working" || !src.streams) continue;
 					for (var j = 0; j < src.streams.length; j++) {
 						var s = src.streams[j];
-
-						// Build display label: "source [quality]" or just "source"
-						var label = src.source;
-						if (s.quality && s.quality !== "") label += " [" + s.quality + "]";
-
-						// ── Use StreamResult constructor (matching official example) ──
-						var sr = null;
-						try {
-							sr = new StreamResult({
-								url: s.url,
-								source: label,
-								headers: s.headers || {},
-							});
-						} catch (e) {
-							// StreamResult constructor not available — fallback to raw object
-							sr = null;
+						// Build minimal stream object — only fields the player needs
+						var obj = {
+							url: s.url,
+							source: src.source,
+							quality: s.quality || "",
+						};
+						// Only add headers if they exist and aren't empty
+						if (
+							s.headers &&
+							typeof s.headers === "object" &&
+							Object.keys(s.headers).length > 0
+						) {
+							obj.headers = s.headers;
 						}
-
-						// If constructor failed or returned null, use raw object
-						if (!sr) {
-							sr = {
-								url: s.url,
-								source: label,
-								headers: s.headers || {},
-							};
+						// Only add subtitles if provided by the source
+						if (s.subtitles && s.subtitles.length > 0) {
+							obj.subtitles = s.subtitles;
 						}
-
-						// Add quality if available
-						if (s.quality) {
-							sr.quality = s.quality;
-						}
-
-						all.push(sr);
-					}
-				}
-
-				// Attach subtitles to all streams — done AFTER stream creation
-				// to keep StreamResult constructor simple
-				if (normalSubs && normalSubs.length && all.length) {
-					for (var si2 = 0; si2 < all.length; si2++) {
-						all[si2].subtitles = normalSubs;
+						all.push(obj);
 					}
 				}
 
