@@ -1,0 +1,9 @@
+{
+  "name": "test",
+  "packageName": "dev.skystream.repo",
+  "description": "SkyStream plugin repository",
+  "manifestVersion": 1,
+  "pluginLists": [
+    "https://raw.githubusercontent.com/thegnsme/test/repo/dist/plugins.json"
+  ]
+}
