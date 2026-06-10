@@ -6,7 +6,7 @@
 	"description": "Multi-source stream aggregator. Aggregates direct DDL and HLS streams from vidlink.pro, videasy.net, embed.smashystream.com, vidsrc.icu, and vidsrc.to into a single unified provider. Uses TMDB for metadata and search.",
 	"authors": ["MultiSource Team"],
 	"languages": ["en", "hi", "es", "ar", "zh", "ja", "fr", "de"],
-	"categories": ["Movie", "TvSeries"],
+	"categories": ["Movie", "TvSeries", "Anime", "Cartoon"],
 	"iconUrl": "https://raw.githubusercontent.com/thegnsme/multisource-api/master/assets/icon.png",
 	"status": 1
 }
