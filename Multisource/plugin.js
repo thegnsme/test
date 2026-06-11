@@ -274,6 +274,26 @@
 	);
 
 	// ═════════════════════════════════════════════════════════════════════════
+	//  SUBTITLE PROVIDER — SubDL + SubSource enrichment
+	// ═════════════════════════════════════════════════════════════════════════
+
+	var SUBTITLE_PROVIDER;
+	try {
+		SUBTITLE_PROVIDER = require("./sources/subtitles_provider");
+		log("Subtitle provider loaded: SubDL + SubSource");
+	} catch (e) {
+		warn("require('./sources/subtitles_provider') failed — subtitles disabled");
+		SUBTITLE_PROVIDER = {
+			fetchSubtitles: function () {
+				return Promise.resolve([]);
+			},
+			attachSubtitlesToStreams: function (s, subs) {
+				return s;
+			},
+		};
+	}
+
+	// ═════════════════════════════════════════════════════════════════════════
 	//  getHome(cb, page)
 	// ═════════════════════════════════════════════════════════════════════════
 
@@ -830,6 +850,48 @@
 				}
 			}
 
+			// ═══ SUBTITLE ENRICHMENT ═══════════════════════════════════════
+			// Fetch subtitles from SubDL + SubSource using TMDB → IMDB mapping.
+			// This ensures accurate subtitle matching for movies, TV, and anime.
+			// Enrichment is done in parallel with a short timeout so stream
+			// aggregation is never blocked.
+			try {
+				var subsPromise = SUBTITLE_PROVIDER.fetchSubtitles(
+					params.tmdbId,
+					params.type,
+					params.season,
+					params.episode,
+				);
+				var subsTimeout = new Promise(function (_, reject) {
+					setTimeout(function () {
+						reject(new Error("subtitle fetch timeout"));
+					}, 15000);
+				});
+				var externalSubs = await Promise.race([subsPromise, subsTimeout]).catch(
+					function () {
+						return [];
+					},
+				);
+				if (externalSubs && externalSubs.length > 0) {
+					log(
+						"  → enriching " +
+							all.length +
+							" stream(s) with " +
+							externalSubs.length +
+							" subtitle(s)",
+					);
+					SUBTITLE_PROVIDER.attachSubtitlesToStreams(all, externalSubs);
+				}
+			} catch (subsErr) {
+				// Non-blocking: subtitles are a best-effort enrichment
+				log(
+					"  → subtitle enrichment skipped (" +
+						(subsErr && subsErr.message) +
+						")",
+				);
+			}
+			// ═══ END SUBTITLE ENRICHMENT ═══════════════════════════════════
+
 			// Sort: highest quality first, then by source name
 			all.sort(function (a, b) {
 				if (b._qr !== a._qr) return b._qr - a._qr;
@@ -852,7 +914,7 @@
 					aggregated.totalSources +
 					" sources (" +
 					aggregated.elapsed_ms +
-					"ms)",
+					"ms) with subtitles",
 			);
 			cb({ success: true, data: streamResults });
 		} catch (e) {
