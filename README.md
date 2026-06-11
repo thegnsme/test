@@ -257,36 +257,36 @@ That's it. `plugin.js` and `_shared.js` never need changes.
 
 ## Subtitle Support
 
-MultiSource now integrates **external subtitle APIs** — [SubDL](https://subdl.com) and [SubSource](https://subsource.net) — to automatically enrich every stream with accurate subtitles matching the content.
+MultiSource integrates **SubDL** subtitle API to automatically enrich every stream with accurate subtitles matching the content.
+
+**Why SubDL only?** SubSource download URLs require API key headers that the Skystream player cannot send when fetching subtitle files on mobile devices. SubDL provides direct file URLs that work without additional headers.
 
 ### How It Works
 
 ```
 plugin.js loadStreams()
     │
-    ├─ SOURCES.aggregateAll()          ← fetch streams from all sources
+    ├─ SOURCES.aggregateAll()              ← fetch streams from all sources
     │
-    ├─ SUBTITLE_PROVIDER.fetchSubtitles()   ← NEW
+    ├─ SUBTITLE_PROVIDER.fetchSubtitles()  ← subtitle enrichment
     │   ├─ TMDB → IMDB mapping            (accurate content matching)
-    │   ├─ SubDL API search               (by IMDB ID)
-    │   └─ SubSource API search           (by IMDB ID)
+    │   └─ SubDL API search               (by IMDB ID, best-per-language)
     │
-    └─ attachSubtitlesToStreams()         ← enrich streams with subtitles
+    └─ attachSubtitlesToStreams()          ← enrich streams with subtitles
 ```
 
 ### Subtitle Pipeline
 
 1. **TMDB → IMDB Resolution**: The subtitle provider resolves the TMDB ID to an IMDB ID (`ttXXXXX`) using TMDB's `external_ids` endpoint. This ensures subtitles are matched to the exact movie, TV episode, or anime.
-2. **Dual API Search**: Both SubDL and SubSource are queried in parallel with a 15-second timeout. Results are deduplicated by URL.
+2. **SubDL Search**: Queries SubDL API with the IMDB ID, returning subtitles with clean language labels (e.g., `"English"`, `"French (SDH)"`). Results are **deduplicated by language** — only the best subtitle per language is kept (preferring hearing-impaired/SDH versions and larger file sizes).
 3. **Stream Enrichment**: Every stream in the result set receives the fetched subtitles. Streams that already carry subtitles from their source (e.g., ezvidapi, vidlink.pro) keep their existing subtitles and receive additional ones — new URLs are deduplicated.
-4. **Non-Blocking**: Subtitle fetching runs in parallel with source aggregation and has its own timeout. If subtitle APIs are unreachable, streams are returned without subtitles — content playback is never blocked.
+4. **Non-Blocking**: Subtitle fetching runs in parallel with source aggregation and has its own 15-second timeout. If subtitle APIs are unreachable, streams are returned without subtitles — content playback is never blocked.
 
-### Subtitle APIs Used
+### Subtitle API
 
-| Provider      | API Key                                                               | Purpose                   |
-| ------------- | --------------------------------------------------------------------- | ------------------------- |
-| **SubDL**     | `subdl_2UBZXxejmmdfmlH4ZMyfDhpLDaSGCMIb3TelEAjjbMk`                   | Primary subtitle source   |
-| **SubSource** | `sk_296c674d051b9c4cc6d3ad148bd8a624986c0d6e3279f4ff6aa6acd907c3d703` | Secondary subtitle source |
+| Provider  | API Key                                             | Purpose                 |
+| --------- | --------------------------------------------------- | ----------------------- |
+| **SubDL** | `subdl_2UBZXxejmmdfmlH4ZMyfDhpLDaSGCMIb3TelEAjjbMk` | Primary subtitle source |
 
 ### Architecture
 
@@ -295,7 +295,7 @@ All subtitle logic lives in a single file:
 ```
 multisource/
 ├── sources/
-│   ├── subtitles_provider.js    ← SubDL + SubSource integration
+│   ├── subtitles_provider.js    ← SubDL integration (not in barrel)
 │   ├── index.js                 ← barrel (unchanged)
 │   └── _shared.js               ← shared HTTP helpers (unchanged)
 ├── plugin.js                    ← calls subtitle provider in loadStreams
@@ -305,11 +305,12 @@ multisource/
 ### Key Features
 
 - **Accurate Matching**: Uses TMDB → IMDB mapping — subtitles match the exact content, not random placement.
-- **Dual Source**: Queries both SubDL and SubSource for maximum coverage.
-- **Deduplication**: Prevents duplicate subtitle URLs across both providers.
-- **Source Subtitle Passthrough**: Existing source-provided subtitles (from ezvidapi, vidlink, videasy) are preserved and augmented.
+- **Clean Labels**: Subtitle labels show proper language names (e.g., `"English"`, `"French (SDH)"`), not release filenames.
+- **Language Deduplication**: Only one subtitle entry per language (best quality, preferring SDH).
+- **Source Subtitle Passthrough**: Existing source-provided subtitles are preserved and augmented.
 - **Non-Blocking**: 15-second timeout; subtitle failures never affect stream delivery.
 - **Edge Case Handling**: Works for movies, TV series, and anime (any content with a TMDB ID).
+- **No Auth Required**: SubDL download URLs work without additional headers — the player can fetch them directly.
 
 ## Project Structure
 
@@ -348,10 +349,10 @@ multisource/
 
 Latest benchmark run:
 
-| Scenario            | Unique Streams | Sources Responded | Time |
-| ------------------- | -------------- | ----------------- | ---- |
-| Movie (tmdb:550)    | 33             | 12/12             | ~14s |
-| TV (tmdb:1399 S1E1) | 30             | 12/12             | ~15s |
+| Scenario            | Unique Streams | Sources Responded | Subtitles | Time |
+| ------------------- | -------------- | ----------------- | --------- | ---- |
+| Movie (tmdb:550)    | 17             | 6/7               | 5 lang    | ~18s |
+| TV (tmdb:1399 S1E1) | 20             | 5/7               | 9 lang    | ~25s |
 
 Testing is done via the `skystream-cli` tool:
 

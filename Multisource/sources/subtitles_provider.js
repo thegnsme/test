@@ -1,23 +1,27 @@
 /**
  * =============================================================================
- *  Subtitle Provider — SubDL + SubSource Integration (Production)
+ *  Subtitle Provider — SubDL Integration (Production)
  * =============================================================================
  *
- * Fetches subtitles from SubDL and SubSource APIs using TMDB → IMDB mapping
- * for accurate content matching (movie, TV series, anime).
+ * Fetches subtitles from SubDL API using TMDB → IMDB mapping for accurate
+ * content matching (movie, TV series, anime).
  *
  * ARCHITECTURE:
  *   This module is NOT a stream source. It enriches streams WITH subtitles.
- *   It exports:
- *     fetchSubtitles(tmdbId, type, season, episode)
- *       → Promise<Array<{ url, label, lang }>>
+ *   It is required()'d directly by plugin.js — not registered as a source.
  *
- *   plugin.js calls this after aggregating streams, attaching subtitles
- *   to streams that lack them (or augmenting all streams).
+ *   Subtitles are attached using the format the player expects:
+ *     { url: string, label: string, lang: string }
+ *   where label is a human-readable language name like "English" or "English (SDH)".
  *
- * SUBTITLE API KEYS (configurable via plugin.json settings or env vars):
- *   • SubDL:     subdl_2UBZXxejmmdfmlH4ZMyfDhpLDaSGCMIb3TelEAjjbMk
- *   • SubSource:  sk_296c674d051b9c4cc6d3ad148bd8a624986c0d6e3279f4ff6aa6acd907c3d703
+ * WHY SUBDL ONLY:
+ *   SubSource (subsource.net) download URLs require API key headers that the
+ *   Skystream player cannot send when fetching subtitle files on mobile.
+ *   SubDL download URLs (dl.subdl.com) work without additional headers.
+ *
+ * SUBTITLE API KEY:
+ *   Hardcoded as required by SkyStream plugin packaging (no env vars available
+ *   in the QuickJS runtime).
  *
  * USAGE:
  *   var { fetchSubtitles } = require("./subtitles_provider");
@@ -40,89 +44,89 @@ var SUBDL_API_BASE = "https://api.subdl.com/api/v1";
 var SUBDL_DL_BASE = "https://dl.subdl.com";
 var SUBDL_API_KEY = "subdl_2UBZXxejmmdfmlH4ZMyfDhpLDaSGCMIb3TelEAjjbMk";
 
-var SUBSOURCE_API_BASE = "https://api.subsource.net/api/v1";
-var SUBSOURCE_API_KEY =
-	"sk_296c674d051b9c4cc6d3ad148bd8a624986c0d6e3279f4ff6aa6acd907c3d703";
-
-var SUBDL_TIMEOUT = 10000;
-var SUBSOURCE_TIMEOUT = 10000;
+var SUBDL_TIMEOUT = 12000;
 var TMDB_TIMEOUT = 8000;
 
-// SubSource language mapping (API name → iso code)
-var SUBSOURCE_LANG_MAP = {
-	english: "en",
-	spanish: "es",
-	spanish_latin_america: "es",
-	french: "fr",
-	german: "de",
-	portuguese: "pt",
-	brazilian_portuguese: "pb",
-	italian: "it",
-	russian: "ru",
-	japanese: "ja",
-	korean: "ko",
-	chinese: "zh",
-	chinese_simplified: "zh",
-	chinese_traditional: "zh",
-	arabic: "ar",
-	dutch: "nl",
-	polish: "pl",
-	turkish: "tr",
-	swedish: "sv",
-	danish: "da",
-	finnish: "fi",
-	norwegian: "no",
-	hebrew: "he",
-	hindi: "hi",
-	thai: "th",
-	vietnamese: "vi",
-	indonesian: "id",
-	romanian: "ro",
-	czech: "cs",
-	hungarian: "hu",
-	greek: "el",
-	bulgarian: "bg",
-	croatian: "hr",
-	serbian: "sr",
-	ukrainian: "uk",
-	farsi_persian: "fa",
-	malay: "ms",
-	estonian: "et",
-	latvian: "lv",
-	lithuanian: "lt",
-	slovak: "sk",
-	slovenian: "sl",
-	bengali: "bn",
-	tagalog: "tl",
-	bosnian: "bs",
-	macedonian: "mk",
-	albanian: "sq",
-	georgian: "ka",
-	icelandic: "is",
-	catalan: "ca",
-	basque: "eu",
-	galician: "gl",
-	welsh: "cy",
-	swahili: "sw",
-	malayalam: "ml",
-	tamil: "ta",
-	telugu: "te",
-	urdu: "ur",
-	punjabi: "pa",
-	nepali: "ne",
-	sinhala: "si",
-	khmer: "km",
-	lao: "lo",
-	burmese: "my",
-	mongolian: "mn",
-	afrikaans: "af",
-	kurdish: "ku",
+// ═════════════════════════════════════════════════════════════════════════
+//  LANGUAGE NAME MAP — for clean label display in player picker
+// ═════════════════════════════════════════════════════════════════════════
+
+var LANGUAGE_NAMES = {
+	en: "English",
+	es: "Spanish",
+	fr: "French",
+	de: "German",
+	pt: "Portuguese",
+	pb: "Portuguese (BR)",
+	it: "Italian",
+	ru: "Russian",
+	ja: "Japanese",
+	ko: "Korean",
+	zh: "Chinese",
+	ar: "Arabic",
+	nl: "Dutch",
+	pl: "Polish",
+	tr: "Turkish",
+	sv: "Swedish",
+	da: "Danish",
+	fi: "Finnish",
+	no: "Norwegian",
+	he: "Hebrew",
+	hi: "Hindi",
+	th: "Thai",
+	vi: "Vietnamese",
+	id: "Indonesian",
+	ro: "Romanian",
+	cs: "Czech",
+	hu: "Hungarian",
+	el: "Greek",
+	bg: "Bulgarian",
+	hr: "Croatian",
+	sr: "Serbian",
+	uk: "Ukrainian",
+	fa: "Persian",
+	ms: "Malay",
+	et: "Estonian",
+	lv: "Latvian",
+	lt: "Lithuanian",
+	sk: "Slovak",
+	sl: "Slovenian",
+	bn: "Bengali",
+	tl: "Tagalog",
+	bs: "Bosnian",
+	mk: "Macedonian",
+	sq: "Albanian",
+	ka: "Georgian",
+	is: "Icelandic",
+	ca: "Catalan",
+	eu: "Basque",
+	gl: "Galician",
+	cy: "Welsh",
+	sw: "Swahili",
+	ml: "Malayalam",
+	ta: "Tamil",
+	te: "Telugu",
+	ur: "Urdu",
+	pa: "Punjabi",
+	ne: "Nepali",
+	si: "Sinhala",
+	km: "Khmer",
+	lo: "Lao",
+	my: "Burmese",
+	mn: "Mongolian",
+	af: "Afrikaans",
+	ku: "Kurdish",
 };
 
-// SubDL language mapping (2-letter code → iso 639-1)
-var SUBDL_LANG_OVERRIDES = {
-	BR_PT: "pb",
-};
+/**
+ * Resolve language code to human-readable name.
+ * Falls back to the code itself if unknown.
+ */
+function languageName(code) {
+	if (!code) return "Unknown";
+	var lower = String(code).toLowerCase().trim();
+	return LANGUAGE_NAMES[lower] || lower.toUpperCase();
+}
 
 // ═════════════════════════════════════════════════════════════════════════
 //  LOGGING
@@ -146,26 +150,20 @@ function warn() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════
-//  TMDB → IMDB MAPPING
+//  TMDB → IMDB MAPPING (cached)
 // ═════════════════════════════════════════════════════════════════════════
 
 var _imdbCache = {};
 
 /**
  * Resolve TMDB ID to IMDB ID (ttXXXX format).
- * Uses the plugin.js cache layer if available (global tmdbGet),
- * otherwise fetches directly from TMDB API.
- *
- * @param {number} tmdbId
- * @param {string} type - "movie" or "tv"
- * @returns {Promise<string|null>} imdb_id (e.g. "tt1375666") or null
+ * Uses global tmdbGet if available, otherwise fetchTmdbMeta from _shared.
  */
 async function tmdbToImdb(tmdbId, type) {
 	var key = String(tmdbId) + ":" + type;
 	if (_imdbCache[key] !== undefined) return _imdbCache[key];
 
 	try {
-		// Use global tmdbGet if available (from plugin.js context)
 		if (typeof tmdbGet === "function") {
 			var data = await tmdbGet(type + "/" + tmdbId, {
 				append_to_response: "external_ids",
@@ -175,14 +173,12 @@ async function tmdbToImdb(tmdbId, type) {
 				_imdbCache[key] = imdb;
 				return imdb;
 			}
-			// Also check data.imdb_id directly
 			if (data && data.imdb_id) {
 				_imdbCache[key] = data.imdb_id;
 				return data.imdb_id;
 			}
 		}
 
-		// Fallback: use fetchTmdbMeta from _shared.js
 		var meta = await fetchTmdbMeta(tmdbId, type);
 		if (meta && meta.imdb_id) {
 			_imdbCache[key] = meta.imdb_id;
@@ -197,114 +193,19 @@ async function tmdbToImdb(tmdbId, type) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════
-//  SUBDL API
+//  SUBDL LANGUAGE CODE NORMALIZATION
 // ═════════════════════════════════════════════════════════════════════════
 
-/**
- * Fetch subtitles from SubDL API using IMDB ID.
- *
- * @param {string} imdbId - "tt1375666"
- * @param {string} type - "movie" or "tv"
- * @param {number} season
- * @param {number} episode
- * @returns {Promise<Array<{url,label,lang}>>}
- */
-async function fetchSubdlSubtitles(imdbId, type, season, episode) {
-	try {
-		var params = [];
-		params.push("api_key=" + encodeURIComponent(SUBDL_API_KEY));
-		params.push("imdb_id=" + encodeURIComponent(imdbId));
-		params.push("type=" + encodeURIComponent(type === "tv" ? "tv" : "movie"));
-		params.push("subs_per_page=30");
-		params.push("languages=EN");
-		params.push("unpack=1");
+var SUBDL_LANG_MAP = {
+	BR_PT: "pb",
+};
 
-		if (type === "tv") {
-			params.push("season_number=" + (parseInt(season, 10) || 1));
-			params.push("episode_number=" + (parseInt(episode, 10) || 1));
-		}
-
-		var url = SUBDL_API_BASE + "/subtitles?" + params.join("&");
-
-		log("SubDL search: " + url.replace(SUBDL_API_KEY, "***"));
-
-		var resp = await httpGet(url, {
-			Accept: "application/json",
-			"User-Agent":
-				"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-		});
-
-		var data = safeJsonParse(resp);
-		if (!data || data.status !== true) {
-			log("SubDL: no results or error");
-			return [];
-		}
-
-		var subtitles = data.subtitles;
-		if (!Array.isArray(subtitles) || subtitles.length === 0) {
-			return [];
-		}
-
-		var results = [];
-		for (var i = 0; i < subtitles.length; i++) {
-			var sub = subtitles[i];
-			if (!sub || !sub.url) continue;
-
-			var lang = normalizeSubdlLang(sub.lang || sub.language || "en");
-			var name = sub.release_name || sub.name || "";
-			var fileUrl = "";
-
-			// If unpack=1, use unpack_files URLs directly
-			if (sub.unpack_files && Array.isArray(sub.unpack_files)) {
-				for (var fi = 0; fi < sub.unpack_files.length; fi++) {
-					var uf = sub.unpack_files[fi];
-					if (uf && uf.url) {
-						var fullUrl =
-							uf.url.indexOf("http") === 0 ? uf.url : SUBDL_DL_BASE + uf.url;
-						results.push({
-							url: fullUrl,
-							label: name || "SubDL " + lang,
-							lang: lang,
-						});
-					}
-				}
-			} else {
-				// Build download URL from sub.url: /subtitle/123-456.zip
-				fileUrl =
-					sub.url.indexOf("http") === 0 ? sub.url : SUBDL_DL_BASE + sub.url;
-				results.push({
-					url: fileUrl,
-					label: name || "SubDL " + lang,
-					lang: lang,
-				});
-			}
-
-			// Limit to avoid excessive results
-			if (results.length >= 20) break;
-		}
-
-		log("SubDL: " + results.length + " subtitle(s) for " + imdbId);
-		return results;
-	} catch (e) {
-		warn("SubDL error: " + (e && e.message));
-		return [];
-	}
-}
-
-/**
- * Normalize SubDL language codes to ISO 639-1.
- */
 function normalizeSubdlLang(code) {
 	if (!code) return "en";
 	var c = String(code).toUpperCase().trim();
-
-	// Direct overrides
-	if (SUBDL_LANG_OVERRIDES[c]) return SUBDL_LANG_OVERRIDES[c];
-
-	// If it's already 2-letter ISO code
+	if (SUBDL_LANG_MAP[c]) return SUBDL_LANG_MAP[c];
 	if (/^[A-Z]{2}$/.test(c)) return c.toLowerCase();
 
-	// Map language names to codes
 	var nameMap = {
 		ENGLISH: "en",
 		SPANISH: "es",
@@ -342,152 +243,141 @@ function normalizeSubdlLang(code) {
 		PERSIAN: "fa",
 		MALAY: "ms",
 	};
-
 	return nameMap[c] || (c.length === 2 ? c.toLowerCase() : "en");
 }
 
 // ═════════════════════════════════════════════════════════════════════════
-//  SUBSOURCE API
+//  SUBDL API
 // ═════════════════════════════════════════════════════════════════════════
 
 /**
- * Auth headers for SubSource API.
- */
-function subsourceHeaders() {
-	return {
-		"User-Agent":
-			"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-		Accept: "application/json, text/plain, */*",
-		Referer: "https://subsource.net/",
-		Origin: "https://subsource.net",
-		"X-API-Key": SUBSOURCE_API_KEY,
-		"api-key": SUBSOURCE_API_KEY,
-	};
-}
-
-/**
- * Step 1: Resolve IMDB ID → SubSource internal movieId.
+ * Fetch subtitles from SubDL API using IMDB ID.
+ * Returns clean subtitle objects with human-readable labels.
  *
- * @param {string} imdbId
- * @returns {Promise<string|null>}
+ * @param {string} imdbId - "tt0137523"
+ * @param {string} type - "movie" or "tv"
+ * @param {number} season
+ * @param {number} episode
+ * @returns {Promise<Array<{url, label, lang}>>}
  */
-async function subsourceGetMovieId(imdbId) {
+async function fetchSubdlSubtitles(imdbId, type, season, episode) {
 	try {
-		var url =
-			SUBSOURCE_API_BASE +
-			"/movies/search?searchType=imdb&imdb=" +
-			encodeURIComponent(imdbId);
+		var params = [];
+		params.push("api_key=" + encodeURIComponent(SUBDL_API_KEY));
+		params.push("imdb_id=" + encodeURIComponent(imdbId));
+		params.push("type=" + encodeURIComponent(type === "tv" ? "tv" : "movie"));
+		params.push("subs_per_page=50");
+		params.push("unpack=1");
 
-		var resp = await httpGet(url, subsourceHeaders());
-		var data = safeJsonParse(resp);
-
-		if (!data) return null;
-
-		// Response can be an array directly or { data: [...] }
-		var movies = Array.isArray(data)
-			? data
-			: Array.isArray(data.data)
-				? data.data
-				: [];
-
-		if (movies.length > 0 && movies[0].id) {
-			return String(movies[0].id);
+		if (type === "tv") {
+			params.push("season_number=" + (parseInt(season, 10) || 1));
+			params.push("episode_number=" + (parseInt(episode, 10) || 1));
 		}
 
-		return null;
-	} catch (e) {
-		warn("SubSource getMovieId error: " + (e && e.message));
-		return null;
-	}
-}
+		var url = SUBDL_API_BASE + "/subtitles?" + params.join("&");
+		log("SubDL search: " + url.replace(SUBDL_API_KEY, "***"));
 
-/**
- * Step 2: Fetch subtitles for a given SubSource movieId.
- *
- * @param {string} movieId
- * @returns {Promise<Array<{url,label,lang}>>}
- */
-async function subsourceFetchSubtitles(movieId) {
-	try {
-		// Fetch subtitles — limit to popular English subs by default
-		var url =
-			SUBSOURCE_API_BASE +
-			"/subtitles?movieId=" +
-			encodeURIComponent(movieId) +
-			"&sort=popular&limit=50&language=english";
+		var resp = await httpGet(url, {
+			Accept: "application/json",
+			"User-Agent":
+				"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+		});
 
-		var resp = await httpGet(url, subsourceHeaders());
 		var data = safeJsonParse(resp);
-
-		if (!data) return [];
-
-		// Various response shapes
-		var subsList = null;
-		if (Array.isArray(data)) subsList = data;
-		else if (data.subtitles) subsList = data.subtitles;
-		else if (data.data && Array.isArray(data.data)) subsList = data.data;
-		else if (data.data && data.data.subtitles) subsList = data.data.subtitles;
-
-		if (!Array.isArray(subsList) || subsList.length === 0) {
+		if (!data || data.status !== true) {
+			log("SubDL: no results or error");
 			return [];
 		}
 
-		var results = [];
-		for (var i = 0; i < subsList.length && results.length < 30; i++) {
-			var sub = subsList[i];
-			if (!sub) continue;
-
-			var subtitleId = sub.subtitleId || sub.id || sub.subtitle_id || sub._id;
-			if (!subtitleId) continue;
-
-			var lang = normalizeSubsourceLang(sub.language || sub.lang || "en");
-			var name = "";
-			if (sub.releaseInfo && Array.isArray(sub.releaseInfo)) {
-				name = sub.releaseInfo.join(" / ");
-			}
-			name =
-				name ||
-				sub.name ||
-				sub.release_name ||
-				sub.file_name ||
-				"SubSource " + lang;
-
-			// Build download URL
-			var dlUrl =
-				SUBSOURCE_API_BASE +
-				"/subtitles/" +
-				encodeURIComponent(String(subtitleId)) +
-				"/download";
-
-			results.push({
-				url: dlUrl,
-				label: name,
-				lang: lang,
-			});
+		var subtitles = data.subtitles;
+		if (!Array.isArray(subtitles) || subtitles.length === 0) {
+			return [];
 		}
 
-		log("SubSource: " + results.length + " subtitle(s) for movieId=" + movieId);
+		// Collect ALL subtitles first, then deduplicate by language
+		var allResults = [];
+		for (var i = 0; i < subtitles.length; i++) {
+			var sub = subtitles[i];
+			if (!sub) continue;
+
+			var lang = normalizeSubdlLang(sub.lang || sub.language || "en");
+			var isHi = sub.hi === true;
+			var displayLang = languageName(lang);
+
+			// Build label: "English" or "English (SDH)"
+			var label = displayLang;
+			if (isHi) {
+				label = displayLang + " (SDH)";
+			}
+
+			// Check unpacked files
+			if (sub.unpack_files && Array.isArray(sub.unpack_files)) {
+				for (var fi = 0; fi < sub.unpack_files.length; fi++) {
+					var uf = sub.unpack_files[fi];
+					if (uf && uf.url) {
+						var fileUrl =
+							uf.url.indexOf("http") === 0 ? uf.url : SUBDL_DL_BASE + uf.url;
+						allResults.push({
+							url: fileUrl,
+							label: label,
+							lang: lang,
+							hi: isHi,
+							format: uf.format || "srt",
+							score: isHi ? 10 : 5,
+							// We prefer higher score: SDH > non-SDH, larger files > smaller
+							size: uf.size || 0,
+							rank: isHi ? 2 : 1,
+						});
+					}
+				}
+			}
+		}
+
+		// Deduplicate by language: keep the best subtitle per language
+		// Best = SDH preferred, then larger file size
+		var bestPerLanguage = {};
+		for (var ri = 0; ri < allResults.length; ri++) {
+			var item = allResults[ri];
+			var existing = bestPerLanguage[item.lang];
+			if (!existing) {
+				bestPerLanguage[item.lang] = item;
+			} else {
+				// Prefer: higher rank (SDH > non-SDH), then larger size
+				if (
+					item.rank > existing.rank ||
+					(item.rank === existing.rank && item.size > existing.size)
+				) {
+					bestPerLanguage[item.lang] = item;
+				}
+			}
+		}
+
+		// Convert to clean output format
+		var results = [];
+		for (var langCode in bestPerLanguage) {
+			if (bestPerLanguage.hasOwnProperty(langCode)) {
+				var best = bestPerLanguage[langCode];
+				results.push({
+					url: best.url,
+					label: best.label,
+					lang: best.lang,
+				});
+			}
+		}
+
+		log(
+			"SubDL: " +
+				results.length +
+				" language(s) (" +
+				allResults.length +
+				" total files) for " +
+				imdbId,
+		);
 		return results;
 	} catch (e) {
-		warn("SubSource fetchSubtitles error: " + (e && e.message));
+		warn("SubDL error: " + (e && e.message));
 		return [];
 	}
-}
-
-/**
- * Normalize SubSource language codes to ISO 639-1.
- */
-function normalizeSubsourceLang(lang) {
-	if (!lang) return "en";
-	var lower = String(lang).toLowerCase().trim();
-
-	// Direct map lookup
-	if (SUBSOURCE_LANG_MAP[lower]) return SUBSOURCE_LANG_MAP[lower];
-
-	// Already 2-letter code
-	if (/^[a-z]{2}$/.test(lower)) return lower;
-
-	return "en";
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -495,10 +385,10 @@ function normalizeSubsourceLang(lang) {
 // ═════════════════════════════════════════════════════════════════════════
 
 /**
- * Fetch subtitles from both SubDL and SubSource for a given piece of content.
+ * Fetch subtitles from SubDL for a given piece of content.
  *
  * Uses TMDB → IMDB mapping to ensure accurate subtitle matching.
- * Results are deduplicated by URL.
+ * Results are deduplicated by language (best subtitle per language).
  *
  * @param {number} tmdbId - TMDB content ID
  * @param {string} type - "movie" or "tv"
@@ -534,52 +424,24 @@ async function fetchSubtitles(tmdbId, type, season, episode) {
 
 		log("  TMDB " + tmdbIdNum + " → IMDB " + imdbId);
 
-		// Step 2: Query both providers in parallel with a safety timeout
-		var results = await Promise.allSettled([
-			fetchSubdlSubtitles(imdbId, contentType, seasonNum, episodeNum),
-			subsourceFetchViaMovieId(imdbId, contentType, seasonNum, episodeNum),
-		]);
-
-		// Step 3: Merge and deduplicate
-		var seen = {};
-		var all = [];
-
-		for (var ri = 0; ri < results.length; ri++) {
-			var r = results[ri];
-			if (r.status !== "fulfilled" || !Array.isArray(r.value)) continue;
-			for (var si = 0; si < r.value.length; si++) {
-				var sub = r.value[si];
-				if (!sub || !sub.url) continue;
-				// Deduplicate by URL
-				if (seen[sub.url]) continue;
-				seen[sub.url] = true;
-				all.push(sub);
-			}
-		}
+		// Step 2: Query SubDL
+		var subdlSubs = await fetchSubdlSubtitles(
+			imdbId,
+			contentType,
+			seasonNum,
+			episodeNum,
+		);
 
 		log(
 			"  → " +
-				all.length +
-				" unique subtitles in " +
+				subdlSubs.length +
+				" subtitles in " +
 				(Date.now() - start) +
 				"ms",
 		);
-		return all;
+		return subdlSubs;
 	} catch (e) {
 		warn("fetchSubtitles error: " + (e && e.message));
-		return [];
-	}
-}
-
-/**
- * Wrapper: get SubSource movieId then fetch subtitles.
- */
-async function subsourceFetchViaMovieId(imdbId, type, season, episode) {
-	try {
-		var movieId = await subsourceGetMovieId(imdbId);
-		if (!movieId) return [];
-		return await subsourceFetchSubtitles(movieId);
-	} catch (e) {
 		return [];
 	}
 }
@@ -593,9 +455,7 @@ async function subsourceFetchViaMovieId(imdbId, type, season, episode) {
  * @returns {Array} Streams with subtitles attached
  */
 function attachSubtitlesToStreams(streams, subtitles) {
-	// Guard: streams must be a non-null array
 	if (!streams || !Array.isArray(streams)) return streams;
-	// If no external subtitles, leave streams completely unchanged
 	if (!subtitles || !Array.isArray(subtitles) || subtitles.length === 0) {
 		return streams;
 	}
