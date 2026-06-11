@@ -33,13 +33,16 @@ var SOURCES_REGISTRY = {
 	"vixsrc.to": require("./vixsrc_to"),
 	lordflix: require("./lordflix"),
 	"vidsrc.xyz": require("./vidsrc_xyz"),
-	"2embed.cc": require("./embed_cc"),
 	ezvidapi: require("./ezvidapi"),
-	"superembed.stream": require("./superembed_stream"),
-	"multiembed.mov": require("./multiembed_mov"),
 	"apiplayer.ru": require("./apiplayer_ru"),
-	"mappletv.uk": require("./mappletv_uk"),
-	"embedmaster.com": require("./embedmaster_js"),
+	// ═══ REMOVED: broken sources ═══════════════════════════════════════
+	// 2embed.cc      — site blocks requests ("embed page empty")
+	// superembed.stream — same backend as multiembed.mov, both blocked
+	// multiembed.mov    — directstream.php returns empty, page blocked
+	// embedmaster.com   — embeds require Cloudflare Turnstile, can't play directly
+	// mappletv.uk       — API returns valid M3U8 but all variants serve a
+	//                     7-second tutorial/promo video, not real content
+	// ═══════════════════════════════════════════════════════════════════
 	// ── Add new sources above this line ──
 };
 
