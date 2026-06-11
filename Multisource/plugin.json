@@ -1,12 +1,16 @@
 {
-	"packageName": "com.multisource.streams",
-	"name": "MultiSource",
-	"version": 1,
-	"baseUrl": "https://api.themoviedb.org/3",
-	"description": "Multi-source stream aggregator. Aggregates direct DDL and HLS streams from vidlink.pro, videasy.net, embed.smashystream.com, vidsrc.icu, and vidsrc.to into a single unified provider. Uses TMDB for metadata and search.",
-	"authors": ["MultiSource Team"],
-	"languages": ["en", "hi", "es", "ar", "zh", "ja", "fr", "de"],
-	"categories": ["Movie", "TvSeries", "Anime", "Cartoon"],
-	"iconUrl": "https://raw.githubusercontent.com/thegnsme/multisource-api/master/assets/icon.png",
-	"status": 1
+  "packageName": "com.multisource.streams.multisource",
+  "name": "MultiSource",
+  "version": 1,
+  "baseUrl": "https://example.com",
+  "description": "MultiSource plugin (Sky Gen 2)",
+  "authors": [
+    "MultiSource Team"
+  ],
+  "languages": [
+    "en"
+  ],
+  "categories": [
+    "Others"
+  ]
 }
