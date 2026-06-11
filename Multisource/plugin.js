@@ -59,7 +59,7 @@
 	var CACHE_MAX = 500; // max entries before eviction
 	var MAX_RETRIES = 2;
 	var RETRY_BASE_MS = 1000;
-	var HOME_TIMEOUT = 15000;
+	var HOME_TIMEOUT = 10000;
 	var LOAD_TV_TIMEOUT = 40000;
 	var LOAD_MOVIE_TIMEOUT = 15000;
 
@@ -320,8 +320,15 @@
 	async function getHome(cb, page) {
 		page = parseInt(page) || 1;
 		log("getHome(page=" + page + ")");
-		var results = {},
-			pending = HOME_CATS.length,
+
+		// Pre-populate results with all category keys so timeout never returns an empty map.
+		// SkyStream Gen 2 expects data to be a Map<String, MultimediaItem[]>
+		// An empty object {} causes "not a map" error in some player versions.
+		var results = {};
+		for (var ci = 0; ci < HOME_CATS.length; ci++) {
+			results[HOME_CATS[ci].n] = [];
+		}
+		var pending = HOME_CATS.length,
 			done = false,
 			start = Date.now();
 
