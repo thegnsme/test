@@ -317,7 +317,7 @@
 		});
 	}
 
-	async function getHome(cb, page) {
+	function getHome(cb, page) {
 		page = parseInt(page) || 1;
 		log("getHome(page=" + page + ")");
 
@@ -366,7 +366,7 @@
 	//  search(query, cb)
 	// ═════════════════════════════════════════════════════════════════════════
 
-	async function search(query, cb) {
+	function search(query, cb) {
 		var q = String(query || "").trim();
 		if (!q) return cb({ success: true, data: [] });
 		log('search("' + q + '")');
@@ -400,28 +400,29 @@
 			return out;
 		}
 
-		try {
-			var rs = await Promise.all([
-				tmdbGet("search/multi", { query: q, page: 1, include_adult: false }),
-				tmdbGet("search/movie", { query: q, page: 1, include_adult: false }),
-				tmdbGet("search/tv", { query: q, page: 1, include_adult: false }),
-			]);
-			var seen = {},
-				out = [];
-			function add(arr) {
-				for (var i = 0; i < arr.length; i++)
-					if (!seen[arr[i].url]) {
-						seen[arr[i].url] = true;
-						out.push(arr[i]);
-					}
-			}
-			add(fromResults(rs[0]));
-			add(fromResults(rs[1], "movie"));
-			add(fromResults(rs[2], "series"));
-			cb({ success: true, data: out.slice(0, 60) });
-		} catch (e) {
-			cb({ success: true, data: [] });
-		}
+		Promise.all([
+			tmdbGet("search/multi", { query: q, page: 1, include_adult: false }),
+			tmdbGet("search/movie", { query: q, page: 1, include_adult: false }),
+			tmdbGet("search/tv", { query: q, page: 1, include_adult: false }),
+		])
+			.then(function (rs) {
+				var seen = {},
+					out = [];
+				function add(arr) {
+					for (var i = 0; i < arr.length; i++)
+						if (!seen[arr[i].url]) {
+							seen[arr[i].url] = true;
+							out.push(arr[i]);
+						}
+				}
+				add(fromResults(rs[0]));
+				add(fromResults(rs[1], "movie"));
+				add(fromResults(rs[2], "series"));
+				cb({ success: true, data: out.slice(0, 60) });
+			})
+			.catch(function () {
+				cb({ success: true, data: [] });
+			});
 	}
 
 	// ═════════════════════════════════════════════════════════════════════════
@@ -453,7 +454,7 @@
 		return null;
 	}
 
-	async function load(url, cb) {
+	function load(url, cb) {
 		try {
 			var parsed = parseRef(url);
 			if (!parsed || !parsed.id)
@@ -501,189 +502,199 @@
 				});
 			}, loadBudget);
 
-			var data = await tmdbGet(apiType + "/" + id, {
+			tmdbGet(apiType + "/" + id, {
 				append_to_response: "credits,videos,external_ids",
-			});
-
-			if (!data)
-				return safe({
-					success: true,
-					data: new MultimediaItem({
-						title: "Content",
-						url: "nuvio://" + parsed.api + "/" + id,
-						posterUrl: "",
-						type: apiType === "tv" ? "series" : "movie",
-					}),
-				});
-
-			var isSeries = apiType === "tv";
-			var title =
-				data.title ||
-				data.name ||
-				data.original_title ||
-				data.original_name ||
-				"Unknown";
-			var year =
-				parseInt(
-					(data.release_date || data.first_air_date || "").split("-")[0],
-					10,
-				) || undefined;
-			var poster = data.poster_path ? img(IMG_POST, data.poster_path) : "";
-			var banner = data.backdrop_path
-				? img(IMG_BACK, data.backdrop_path)
-				: poster;
-			var desc = (data.overview || "")
-				.replace(/<[^>]*>/g, "")
-				.trim()
-				.substring(0, 500);
-
-			// Build cast
-			var cast;
-			if (data.credits && data.credits.cast && data.credits.cast.length) {
-				cast = data.credits.cast.slice(0, 20).map(function (c) {
-					return new Actor({
-						name: c.name || "Unknown",
-						role: c.character || "",
-						image: c.profile_path ? img(IMG_PROF, c.profile_path) : "",
-					});
-				});
-			}
-
-			// Build trailers
-			var trailers;
-			if (data.videos && data.videos.results) {
-				trailers = data.videos.results
-					.filter(function (v) {
-						return (
-							v &&
-							v.site === "YouTube" &&
-							v.key &&
-							(v.type === "Trailer" || v.type === "Teaser")
-						);
-					})
-					.slice(0, 5)
-					.map(function (v) {
-						return new Trailer({
-							url: "https://www.youtube.com/watch?v=" + v.key,
-							name: v.name || v.type || "Trailer",
+			})
+				.then(function (data) {
+					if (!data)
+						return safe({
+							success: true,
+							data: new MultimediaItem({
+								title: "Content",
+								url: "nuvio://" + parsed.api + "/" + id,
+								posterUrl: "",
+								type: apiType === "tv" ? "series" : "movie",
+							}),
 						});
-					});
-			}
 
-			// Build genres
-			var genres = data.genres
-				? data.genres.map(function (g) {
-						return g.name;
-					})
-				: undefined;
+					var isSeries = apiType === "tv";
+					var title =
+						data.title ||
+						data.name ||
+						data.original_title ||
+						data.original_name ||
+						"Unknown";
+					var year =
+						parseInt(
+							(data.release_date || data.first_air_date || "").split("-")[0],
+							10,
+						) || undefined;
+					var poster = data.poster_path ? img(IMG_POST, data.poster_path) : "";
+					var banner = data.backdrop_path
+						? img(IMG_BACK, data.backdrop_path)
+						: poster;
+					var desc = (data.overview || "")
+						.replace(/<[^>]*>/g, "")
+						.trim()
+						.substring(0, 500);
 
-			// Status
-			var status;
-			if (data.status) {
-				var sv = String(data.status).toLowerCase();
-				if (sv === "ended" || sv === "canceled") status = "completed";
-				else if (
-					sv === "returning series" ||
-					sv === "continuing" ||
-					sv === "in production"
-				)
-					status = "ongoing";
-			}
-
-			function finish(eps) {
-				if (!eps || !eps.length)
-					eps = [
-						new Episode({
-							name: isSeries ? "Season 1 Episode 1" : "Play",
-							url: isSeries
-								? "nuvio://tv/" + id + "/1/1"
-								: "nuvio://movie/" + id,
-							season: 1,
-							episode: 1,
-							posterUrl: poster,
-						}),
-					];
-				safe({
-					success: true,
-					data: new MultimediaItem({
-						title: title,
-						url: "nuvio://" + parsed.api + "/" + id,
-						posterUrl: poster,
-						bannerUrl: banner,
-						description: desc,
-						type: isSeries ? "series" : "movie",
-						year: year && year > 1900 && year < 2200 ? year : undefined,
-						score: data.vote_average || undefined,
-						duration: data.runtime || undefined,
-						genres: genres,
-						cast: cast,
-						trailers: trailers,
-						status: status,
-						episodes: eps,
-					}),
-				});
-			}
-
-			if (!isSeries) return finish(null);
-
-			var seasons = (data.seasons || []).filter(function (s) {
-				return s && s.season_number > 0;
-			});
-			if (!seasons.length) return finish(null);
-
-			var allEps = [],
-				epPend = seasons.length,
-				sIdx = 0,
-				sInFlight = 0;
-
-			function nextSeason() {
-				while (sInFlight < 6 && sIdx < seasons.length) {
-					(function (sn) {
-						sInFlight++;
-						tmdbGet("tv/" + id + "/season/" + sn)
-							.then(function (sd) {
-								if (sd && sd.episodes) {
-									for (var ei = 0; ei < sd.episodes.length; ei++) {
-										var ep = sd.episodes[ei];
-										if (!ep || !ep.episode_number) continue;
-										allEps.push(
-											new Episode({
-												name: ep.name || "E" + ep.episode_number,
-												url:
-													"nuvio://tv/" +
-													id +
-													"/" +
-													sn +
-													"/" +
-													ep.episode_number,
-												season: sn,
-												episode: ep.episode_number,
-												posterUrl: ep.still_path
-													? img(IMG_STILL, ep.still_path)
-													: "",
-												description: (ep.overview || "").substring(0, 300),
-												airDate: ep.air_date || "",
-											}),
-										);
-									}
-								}
-							})
-							.catch(function () {})
-							.then(function () {
-								sInFlight--;
-								if (--epPend === 0) {
-									allEps.sort(function (a, b) {
-										return a.season - b.season || a.episode - b.episode;
-									});
-									finish(allEps);
-								} else {
-									nextSeason();
-								}
+					// Build cast
+					var cast;
+					if (data.credits && data.credits.cast && data.credits.cast.length) {
+						cast = data.credits.cast.slice(0, 20).map(function (c) {
+							return new Actor({
+								name: c.name || "Unknown",
+								role: c.character || "",
+								image: c.profile_path ? img(IMG_PROF, c.profile_path) : "",
 							});
-					})(seasons[sIdx++].season_number);
-				}
-			}
-			nextSeason();
+						});
+					}
+
+					// Build trailers
+					var trailers;
+					if (data.videos && data.videos.results) {
+						trailers = data.videos.results
+							.filter(function (v) {
+								return (
+									v &&
+									v.site === "YouTube" &&
+									v.key &&
+									(v.type === "Trailer" || v.type === "Teaser")
+								);
+							})
+							.slice(0, 5)
+							.map(function (v) {
+								return new Trailer({
+									url: "https://www.youtube.com/watch?v=" + v.key,
+									name: v.name || v.type || "Trailer",
+								});
+							});
+					}
+
+					// Build genres
+					var genres = data.genres
+						? data.genres.map(function (g) {
+								return g.name;
+							})
+						: undefined;
+
+					// Status
+					var status;
+					if (data.status) {
+						var sv = String(data.status).toLowerCase();
+						if (sv === "ended" || sv === "canceled") status = "completed";
+						else if (
+							sv === "returning series" ||
+							sv === "continuing" ||
+							sv === "in production"
+						)
+							status = "ongoing";
+					}
+
+					function finish(eps) {
+						if (!eps || !eps.length)
+							eps = [
+								new Episode({
+									name: isSeries ? "Season 1 Episode 1" : "Play",
+									url: isSeries
+										? "nuvio://tv/" + id + "/1/1"
+										: "nuvio://movie/" + id,
+									season: 1,
+									episode: 1,
+									posterUrl: poster,
+								}),
+							];
+						safe({
+							success: true,
+							data: new MultimediaItem({
+								title: title,
+								url: "nuvio://" + parsed.api + "/" + id,
+								posterUrl: poster,
+								bannerUrl: banner,
+								description: desc,
+								type: isSeries ? "series" : "movie",
+								year: year && year > 1900 && year < 2200 ? year : undefined,
+								score: data.vote_average || undefined,
+								duration: data.runtime || undefined,
+								genres: genres,
+								cast: cast,
+								trailers: trailers,
+								status: status,
+								episodes: eps,
+							}),
+						});
+					}
+
+					if (!isSeries) return finish(null);
+
+					var seasons = (data.seasons || []).filter(function (s) {
+						return s && s.season_number > 0;
+					});
+					if (!seasons.length) return finish(null);
+
+					var allEps = [],
+						epPend = seasons.length,
+						sIdx = 0,
+						sInFlight = 0;
+
+					function nextSeason() {
+						while (sInFlight < 6 && sIdx < seasons.length) {
+							(function (sn) {
+								sInFlight++;
+								tmdbGet("tv/" + id + "/season/" + sn)
+									.then(function (sd) {
+										if (sd && sd.episodes) {
+											for (var ei = 0; ei < sd.episodes.length; ei++) {
+												var ep = sd.episodes[ei];
+												if (!ep || !ep.episode_number) continue;
+												allEps.push(
+													new Episode({
+														name: ep.name || "E" + ep.episode_number,
+														url:
+															"nuvio://tv/" +
+															id +
+															"/" +
+															sn +
+															"/" +
+															ep.episode_number,
+														season: sn,
+														episode: ep.episode_number,
+														posterUrl: ep.still_path
+															? img(IMG_STILL, ep.still_path)
+															: "",
+														description: (ep.overview || "").substring(0, 300),
+														airDate: ep.air_date || "",
+													}),
+												);
+											}
+										}
+									})
+									.catch(function () {})
+									.then(function () {
+										sInFlight--;
+										if (--epPend === 0) {
+											allEps.sort(function (a, b) {
+												return a.season - b.season || a.episode - b.episode;
+											});
+											finish(allEps);
+										} else {
+											nextSeason();
+										}
+									});
+							})(seasons[sIdx++].season_number);
+						}
+					}
+					nextSeason();
+				})
+				.catch(function (e) {
+					warn("load: error for url=" + url + ": " + (e && e.message));
+					// If safety timeout hasn't fired, use it; otherwise this is a no-op
+					cb({
+						success: false,
+						errorCode: "LOAD_ERROR",
+						message: "Content temporarily unavailable",
+					});
+				});
 		} catch (e) {
 			warn("load: error for url=" + url + ": " + (e && e.message));
 			cb({
