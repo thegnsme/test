@@ -1,10 +1,24 @@
 /**
  * =============================================================================
- *  Subtitle Provider — SubDL Integration (Production)
+ *  Subtitle Provider — OpenSubtitles v2 (Production)
  * =============================================================================
  *
- * Fetches subtitles from SubDL API using TMDB → IMDB mapping for accurate
- * content matching (movie, TV series, anime).
+ * Fetches English subtitles from the OpenSubtitles REST API v2.
+ *
+ * WHY OpenSubtitles v2 (not SubDL, not SubSource, not v3):
+ *   • SubDL: season/episode filtering is broken — returns wrong episode subs.
+ *     Download URLs also return 404 regularly. Unreliable.
+ *   • SubSource (subsource.net): entire API behind Cloudflare — unusable from
+ *     the SkyStream QuickJS runtime (can't execute JS challenges server-side).
+ *   • OpenSubtitles v3 (api.opensubtitles.com): requires auth tokens on download
+ *     URLs — the SkyStream player can't send custom headers when fetching subs.
+ *   • OpenSubtitles v2 (rest.opensubtitles.org): ✅ works.
+ *     — Search by IMDB ID with simple User-Agent header
+ *     — Download URLs return raw SRT, no auth needed
+ *     — No Cloudflare protection
+ *     — Proper season/episode filtering
+ *     — Rich metadata (rating, downloads, hearing-impaired flag)
+ *     — Much better English coverage: 6-32 English subs per title
  *
  * ARCHITECTURE:
  *   This module is NOT a stream source. It enriches streams WITH subtitles.
@@ -15,7 +29,7 @@
  *   may strip unknown fields including `subtitles`.
  *     CORRECT:
  *       var stream = new StreamResult({ url, source, headers, quality });
- *       stream.subtitles = normalizeSubtitles(subtitles);
+ *       stream.subtitles = cloneSubtitles(subtitles);
  *     WRONG:
  *       var stream = new StreamResult({ url, source, subtitles: subs });
  *
@@ -36,19 +50,10 @@
  *   - `label` = used by some players (netmirror pattern, DEVELOPER.md spec)
  *   - `lang`  = ISO language code for player subtitle sync
  *
- * WHY SUBDL ONLY:
- *   SubSource (subsource.net) download URLs require API key headers that the
- *   Skystream player cannot send when fetching subtitle files on mobile.
- *   SubDL download URLs (dl.subdl.com) work without additional headers.
- *
- * SUBTITLE API KEY:
- *   Hardcoded as required by SkyStream plugin packaging (no env vars available
- *   in the QuickJS runtime).
- *
  * USAGE:
- *   var { fetchSubtitles, normalizeSubtitles, cloneSubtitles } = require("./subtitles_provider");
+ *   var { fetchSubtitles, normalizeSubtitle, cloneSubtitles } = require("./subtitles_provider");
  *   var subs = await fetchSubtitles(550, "movie", 1, 1);
- *   // subs = [ { url: "...", name: "English", label: "English", lang: "en" }, ... ]
+ *   // subs = [ { url: "...srt", name: "English", label: "English", lang: "en" }, ... ]
  *   stream.subtitles = cloneSubtitles(subs);  // ← deep-cloned per stream
  * =============================================================================
  */
@@ -63,12 +68,17 @@ var { httpGet, safeJsonParse, fetchTmdbMeta } = require("./_shared");
 
 var TAG = "SubProvider";
 
-var SUBDL_API_BASE = "https://api.subdl.com/api/v1";
-var SUBDL_DL_BASE = "https://dl.subdl.com";
-var SUBDL_API_KEY = "subdl_2UBZXxejmmdfmlH4ZMyfDhpLDaSGCMIb3TelEAjjbMk";
-
-var SUBDL_TIMEOUT = 12000;
-var TMDB_TIMEOUT = 8000;
+// ═══ OpenSubtitles v2 REST API ═══
+// Search: GET /search/imdbid-{imdbId}  (imdbId WITHOUT "tt" prefix)
+//   Header: User-Agent: TemporaryUserAgent
+//   Returns: array of subtitle objects with IDSubtitleFile for download
+//
+// Download: GET /en/download/filead/{IDSubtitleFile}
+//   Returns: raw SRT content (no auth headers needed!)
+var OS_BASE = "https://rest.opensubtitles.org";
+var DL_BASE = "https://dl.opensubtitles.org";
+var OS_USER_AGENT = "TemporaryUserAgent";
+var OS_TIMEOUT = 10000;
 
 // ═════════════════════════════════════════════════════════════════════════
 //  LANGUAGE NAME MAP — for clean label display in player picker
@@ -268,16 +278,23 @@ function cloneSubtitles(subtitles) {
 // ═════════════════════════════════════════════════════════════════════════
 
 var _imdbCache = {};
+var _imdbCacheKeys = [];
+var _imdbCacheMax = 200;
 
 /**
  * Resolve TMDB ID to IMDB ID (ttXXXX format).
  * Uses global tmdbGet if available, otherwise fetchTmdbMeta from _shared.
+ *
+ * @param {number|string} tmdbId
+ * @param {string} type - "movie" or "tv"
+ * @returns {Promise<string|null>} IMDB ID like "tt0137523" or null
  */
 async function tmdbToImdb(tmdbId, type) {
 	var key = String(tmdbId) + ":" + type;
 	if (_imdbCache[key] !== undefined) return _imdbCache[key];
 
 	try {
+		// If the SkyStream runtime provides tmdbGet(), use it
 		if (typeof tmdbGet === "function") {
 			var data = await tmdbGet(type + "/" + tmdbId, {
 				append_to_response: "external_ids",
@@ -285,17 +302,30 @@ async function tmdbToImdb(tmdbId, type) {
 			if (data && data.external_ids && data.external_ids.imdb_id) {
 				var imdb = data.external_ids.imdb_id;
 				_imdbCache[key] = imdb;
+				_imdbCacheKeys.push(key);
+				if (_imdbCacheKeys.length > _imdbCacheMax) {
+					delete _imdbCache[_imdbCacheKeys.shift()];
+				}
 				return imdb;
 			}
 			if (data && data.imdb_id) {
 				_imdbCache[key] = data.imdb_id;
+				_imdbCacheKeys.push(key);
+				if (_imdbCacheKeys.length > _imdbCacheMax) {
+					delete _imdbCache[_imdbCacheKeys.shift()];
+				}
 				return data.imdb_id;
 			}
 		}
 
+		// Fallback: use fetchTmdbMeta from _shared.js
 		var meta = await fetchTmdbMeta(tmdbId, type);
 		if (meta && meta.imdb_id) {
 			_imdbCache[key] = meta.imdb_id;
+			_imdbCacheKeys.push(key);
+			if (_imdbCacheKeys.length > _imdbCacheMax) {
+				delete _imdbCache[_imdbCacheKeys.shift()];
+			}
 			return meta.imdb_id;
 		}
 
@@ -307,192 +337,267 @@ async function tmdbToImdb(tmdbId, type) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════
-//  SUBDL LANGUAGE CODE NORMALIZATION
-// ═════════════════════════════════════════════════════════════════════════
-
-var SUBDL_LANG_MAP = {
-	BR_PT: "pb",
-};
-
-function normalizeSubdlLang(code) {
-	if (!code) return "en";
-	var c = String(code).toUpperCase().trim();
-	if (SUBDL_LANG_MAP[c]) return SUBDL_LANG_MAP[c];
-	if (/^[A-Z]{2}$/.test(c)) return c.toLowerCase();
-
-	var nameMap = {
-		ENGLISH: "en",
-		SPANISH: "es",
-		FRENCH: "fr",
-		GERMAN: "de",
-		PORTUGUESE: "pt",
-		ITALIAN: "it",
-		RUSSIAN: "ru",
-		JAPANESE: "ja",
-		KOREAN: "ko",
-		CHINESE: "zh",
-		ARABIC: "ar",
-		DUTCH: "nl",
-		POLISH: "pl",
-		TURKISH: "tr",
-		SWEDISH: "sv",
-		DANISH: "da",
-		FINNISH: "fi",
-		NORWEGIAN: "no",
-		HEBREW: "he",
-		HINDI: "hi",
-		THAI: "th",
-		VIETNAMESE: "vi",
-		INDONESIAN: "id",
-		ROMANIAN: "ro",
-		CZECH: "cs",
-		HUNGARIAN: "hu",
-		GREEK: "el",
-		BULGARIAN: "bg",
-		CROATIAN: "hr",
-		SERBIAN: "sr",
-		UKRAINIAN: "uk",
-		FARSI_PERSIAN: "fa",
-		FARSI: "fa",
-		PERSIAN: "fa",
-		MALAY: "ms",
-	};
-	return nameMap[c] || (c.length === 2 ? c.toLowerCase() : "en");
-}
-
-// ═════════════════════════════════════════════════════════════════════════
-//  SUBDL API
+//  OPENSUBTITLES v2 API
 // ═════════════════════════════════════════════════════════════════════════
 
 /**
- * Fetch subtitles from SubDL API using IMDB ID.
- * Returns clean subtitle objects with human-readable labels.
+ * Search OpenSubtitles v2 REST API by IMDB ID.
+ *
+ * The v2 REST API (rest.opensubtitles.org) is less restricted than v3:
+ *   - No API key needed
+ *   - Requires a User-Agent header identifying the client application
+ *   - Returns rich metadata including rating, downloads, hearing-impaired flag
+ *   - Supports movies and TV episodes (with season/episode fields)
+ *
+ * @param {string} imdbId - IMDB ID (with or without "tt" prefix)
+ * @returns {Promise<Array>} Array of subtitle result objects, or empty array
+ */
+async function searchOpenSubtitles(imdbId) {
+	// Strip "tt" prefix — OpenSubtitles v2 expects raw numeric ID
+	var searchId = String(imdbId).replace(/^tt/i, "");
+
+	if (!searchId || !/^\d+$/.test(searchId)) {
+		warn("searchOpenSubtitles: invalid imdbId '" + imdbId + "'");
+		return [];
+	}
+
+	var url = OS_BASE + "/search/imdbid-" + searchId;
+
+	try {
+		var resp = await httpGet(
+			url,
+			{
+				"User-Agent": OS_USER_AGENT,
+				Accept: "application/json",
+			},
+			2, // retries
+		);
+
+		if (!resp || resp.length < 10) {
+			return [];
+		}
+
+		var data = safeJsonParse(resp);
+		if (Array.isArray(data)) {
+			return data;
+		}
+
+		return [];
+	} catch (e) {
+		warn("searchOpenSubtitles error: " + (e && e.message));
+		return [];
+	}
+}
+
+/**
+ * Compute a quality score for an OpenSubtitles result.
+ *
+ * Higher score = better subtitle recommendation.
+ * Factors:
+ *   - Downloads (popularity signal)
+ *   - Rating (quality signal)
+ *   - Penalty for "bad" flag (SubBad)
+ *   - Penalty for hearing-impaired (prefer clean subs unless explicit)
+ *
+ * @param {object} sub - OpenSubtitles result object
+ * @returns {number} Quality score (higher = better)
+ */
+function subtitleQualityScore(sub) {
+	if (!sub) return 0;
+
+	var downloads = parseInt(sub.SubDownloadsCnt, 10) || 0;
+	var rating = parseFloat(sub.SubRating) || 0;
+
+	// Base score: popularity × quality
+	var score = downloads * (rating || 1);
+
+	// Severe penalty for explicitly bad subtitles
+	if (sub.SubBad === "1") {
+		score *= 0.05;
+	}
+
+	// Moderate penalty for hearing-impaired (SDH) subs
+	// Some users may prefer these, so don't eliminate entirely
+	if (sub.SubHearingImpaired === "1") {
+		score *= 0.3;
+	}
+
+	// Slight boost for SRT format (most compatible)
+	if (sub.SubFormat && sub.SubFormat.toLowerCase() === "srt") {
+		score *= 1.1;
+	}
+
+	// Slight boost for higher rating
+	score *= 1 + rating / 10;
+
+	return score;
+}
+
+/**
+ * Fetch English subtitles from OpenSubtitles v2 for a given IMDB ID.
+ *
+ * For TV shows, filters by exact season and episode match.
+ * Returns up to 3 best English subtitles, sorted by quality.
  *
  * @param {string} imdbId - "tt0137523"
  * @param {string} type - "movie" or "tv"
- * @param {number} season
- * @param {number} episode
- * @returns {Promise<Array<{url, name, label, lang}>>}
+ * @param {number} [season=1]
+ * @param {number} [episode=1]
+ * @returns {Promise<Array<{url: string, name: string, label: string, lang: string}>>}
  */
-async function fetchSubdlSubtitles(imdbId, type, season, episode) {
+async function fetchOsSubtitles(imdbId, type, season, episode) {
 	try {
-		var params = [];
-		params.push("api_key=" + encodeURIComponent(SUBDL_API_KEY));
-		params.push("imdb_id=" + encodeURIComponent(imdbId));
-		params.push("type=" + encodeURIComponent(type === "tv" ? "tv" : "movie"));
-		params.push("subs_per_page=50");
-		params.push("unpack=1");
+		var allResults = await searchOpenSubtitles(imdbId);
+		if (!Array.isArray(allResults) || allResults.length === 0) {
+			log("OpenSubtitles: no results for " + imdbId);
+			return [];
+		}
 
+		log("OpenSubtitles: " + allResults.length + " total results for " + imdbId);
+
+		// Step 1: Filter to English only
+		var english = [];
+		for (var i = 0; i < allResults.length; i++) {
+			var s = allResults[i];
+			if (!s) continue;
+
+			var lang = (s.SubLanguageID || "").toLowerCase().trim();
+			var iso = (s.ISO639 || "").toLowerCase().trim();
+
+			if (lang === "eng" || iso === "en") {
+				english.push(s);
+			}
+		}
+
+		log("  → " + english.length + " English subtitle(s)");
+
+		if (english.length === 0) {
+			return [];
+		}
+
+		// Step 2: For TV, filter by exact season/episode
 		if (type === "tv") {
-			params.push("season_number=" + (parseInt(season, 10) || 1));
-			params.push("episode_number=" + (parseInt(episode, 10) || 1));
-		}
+			var sNum = parseInt(season, 10) || 1;
+			var eNum = parseInt(episode, 10) || 1;
 
-		var url = SUBDL_API_BASE + "/subtitles?" + params.join("&");
-		log("SubDL search: " + url.replace(SUBDL_API_KEY, "***"));
+			var filtered = [];
+			for (var ei = 0; ei < english.length; ei++) {
+				var sub = english[ei];
+				var subS = parseInt(sub.SeriesSeason, 10);
+				var subE = parseInt(sub.SeriesEpisode, 10);
 
-		var resp = await httpGet(url, {
-			Accept: "application/json",
-			"User-Agent":
-				"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-		});
-
-		var data = safeJsonParse(resp);
-		if (!data || data.status !== true) {
-			log("SubDL: no results or error");
-			return [];
-		}
-
-		var subtitles = data.subtitles;
-		if (!Array.isArray(subtitles) || subtitles.length === 0) {
-			return [];
-		}
-
-		// Collect ALL subtitles first, then deduplicate by language
-		var allResults = [];
-		for (var i = 0; i < subtitles.length; i++) {
-			var sub = subtitles[i];
-			if (!sub) continue;
-
-			var lang = normalizeSubdlLang(sub.lang || sub.language || "en");
-			var isHi = sub.hi === true;
-			var displayLang = languageName(lang);
-
-			// Build label: "English" or "English (SDH)"
-			var label = displayLang;
-			if (isHi) {
-				label = displayLang + " (SDH)";
+				// Must match both season AND episode exactly
+				if (subS === sNum && subE === eNum) {
+					filtered.push(sub);
+				}
 			}
 
-			// Check unpacked files
-			if (sub.unpack_files && Array.isArray(sub.unpack_files)) {
-				for (var fi = 0; fi < sub.unpack_files.length; fi++) {
-					var uf = sub.unpack_files[fi];
-					if (uf && uf.url) {
-						var fileUrl =
-							uf.url.indexOf("http") === 0 ? uf.url : SUBDL_DL_BASE + uf.url;
-						allResults.push({
-							url: fileUrl,
-							label: label,
-							lang: lang,
-							name: label,
-							hi: isHi,
-							format: uf.format || "srt",
-							score: isHi ? 10 : 5,
-							size: uf.size || 0,
-							rank: isHi ? 2 : 1,
-						});
+			if (filtered.length === 0) {
+				// Fallback: try anime convention (S0E0 in OpenSubtitles).
+				// Many anime are stored with SeriesSeason=0 and SeriesEpisode=0
+				// regardless of actual episode number. Accept these as a fallback.
+				var animeFallback = [];
+				for (var fi = 0; fi < english.length; fi++) {
+					var fas = english[fi];
+					var faS = parseInt(fas.SeriesSeason, 10);
+					var faE = parseInt(fas.SeriesEpisode, 10);
+					if ((faS === 0 || isNaN(faS)) && (faE === 0 || isNaN(faE))) {
+						animeFallback.push(fas);
 					}
 				}
-			}
-		}
 
-		// Deduplicate by language: keep the best subtitle per language
-		var bestPerLanguage = {};
-		for (var ri = 0; ri < allResults.length; ri++) {
-			var item = allResults[ri];
-			var existing = bestPerLanguage[item.lang];
-			if (!existing) {
-				bestPerLanguage[item.lang] = item;
-			} else {
-				if (
-					item.rank > existing.rank ||
-					(item.rank === existing.rank && item.size > existing.size)
-				) {
-					bestPerLanguage[item.lang] = item;
+				if (animeFallback.length > 0) {
+					log(
+						"  → no exact S" +
+							sNum +
+							"E" +
+							eNum +
+							", but found " +
+							animeFallback.length +
+							" anime-style (S0E0) subs",
+					);
+					filtered = animeFallback;
+				} else {
+					log(
+						"  → no English subs for S" +
+							sNum +
+							"E" +
+							eNum +
+							" (had " +
+							english.length +
+							" English total, none for this episode)",
+					);
+					return [];
 				}
 			}
+
+			english = filtered;
+			log("  → " + english.length + " English for S" + sNum + "E" + eNum);
 		}
 
-		// Convert to normalized output format (name + label + lang)
-		var results = [];
-		for (var langCode in bestPerLanguage) {
-			if (bestPerLanguage.hasOwnProperty(langCode)) {
-				var best = bestPerLanguage[langCode];
-				var normalized = normalizeSubtitle(best);
-				if (normalized) {
-					results.push(normalized);
+		// Step 3: Sort by quality score (descending)
+		english.sort(function (a, b) {
+			return subtitleQualityScore(b) - subtitleQualityScore(a);
+		});
+
+		// Step 4: Build subtitle objects, deduplicate by label
+		var out = [];
+		var seenLabels = {};
+
+		for (var si = 0; si < english.length; si++) {
+			var sub = english[si];
+			var fileId = sub.IDSubtitleFile;
+
+			if (!fileId) continue;
+
+			// Build display label
+			var label = "English";
+
+			// Append hearing-impaired indicator
+			if (sub.SubHearingImpaired === "1") {
+				label += " (SDH)";
+			}
+
+			// Append uploader name for differentiation
+			if (sub.UserNickName) {
+				var nick = String(sub.UserNickName).trim();
+				if (nick && nick.length > 0) {
+					label += " [" + nick + "]";
 				}
 			}
+
+			// Skip duplicate labels
+			if (seenLabels[label]) continue;
+			seenLabels[label] = true;
+
+			// Construct direct SRT download URL
+			// Pattern: https://dl.opensubtitles.org/en/download/filead/{IDSubtitleFile}
+			// Returns raw SRT content — no auth headers needed!
+			var downloadUrl = DL_BASE + "/en/download/filead/" + String(fileId);
+
+			out.push({
+				url: downloadUrl,
+				name: label,
+				label: label,
+				lang: "en",
+			});
+
+			// Limit to at most 3 subtitle options
+			if (out.length >= 3) break;
 		}
 
 		log(
-			"SubDL: " +
-				results.length +
-				" language(s) (" +
-				allResults.length +
-				" total files) for " +
-				imdbId,
+			"OpenSubtitles: returning " + out.length + " English subtitle option(s)",
 		);
-		return results;
+		return out;
 	} catch (e) {
-		warn("SubDL error: " + (e && e.message));
+		warn("fetchOsSubtitles error: " + (e && e.message));
 		return [];
 	}
 }
 
 // ═════════════════════════════════════════════════════════════════════════
-//  ATTACH SUBTITLES TO STREAMS — FIXED version
+//  ATTACH SUBTITLES TO STREAMS
 // ═════════════════════════════════════════════════════════════════════════
 //
 //  🔴 FIX: Deep-clone subtitles for EACH stream to prevent shared-reference
@@ -574,11 +679,13 @@ function attachSubtitlesToStreams(streams, subtitles) {
 // ═════════════════════════════════════════════════════════════════════════
 
 /**
- * Fetch subtitles from SubDL for a given piece of content.
+ * Fetch English subtitles via OpenSubtitles v2 for a given piece of content.
  *
- * Uses TMDB → IMDB mapping to ensure accurate subtitle matching.
- * Results are normalized (name + label + lang fields) and deduplicated
- * by language (best subtitle per language).
+ * Uses TMDB → IMDB mapping to search OpenSubtitles. Only returns English
+ * subtitles, sorted by quality (popularity × rating).
+ *
+ * For TV shows, subtitles are filtered to the exact season/episode.
+ * Download URLs are direct SRT links — no auth headers needed.
  *
  * @param {number} tmdbId - TMDB content ID
  * @param {string} type - "movie" or "tv"
@@ -614,8 +721,8 @@ async function fetchSubtitles(tmdbId, type, season, episode) {
 
 		log("  TMDB " + tmdbIdNum + " → IMDB " + imdbId);
 
-		// Step 2: Query SubDL
-		var subdlSubs = await fetchSubdlSubtitles(
+		// Step 2: Fetch English subtitles from OpenSubtitles v2
+		var subs = await fetchOsSubtitles(
 			imdbId,
 			contentType,
 			seasonNum,
@@ -624,12 +731,12 @@ async function fetchSubtitles(tmdbId, type, season, episode) {
 
 		log(
 			"  → " +
-				subdlSubs.length +
-				" subtitles in " +
+				subs.length +
+				" English subtitle(s) in " +
 				(Date.now() - start) +
 				"ms",
 		);
-		return subdlSubs;
+		return subs;
 	} catch (e) {
 		warn("fetchSubtitles error: " + (e && e.message));
 		return [];

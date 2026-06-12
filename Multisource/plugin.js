@@ -954,18 +954,19 @@
 			var streamResults = [];
 
 			// ═══ BUILD CANONICAL SUBTITLE SET (source-independent) ═══
-			// 🔴 KEY FIX: Use SubDL subtitles as the canonical set for ALL streams.
-			//   When ALL streams have IDENTICAL subtitle tracks, the player never
-			//   needs to rebuild them on source/quality switch → NO HLS CRASH.
+			// 🔴 KEY FIX: Use OpenSubtitles subtitles as the canonical set for
+			//   ALL streams. When ALL streams have IDENTICAL subtitle tracks, the
+			//   player never needs to rebuild them on source/quality switch →
+			//   NO HLS CRASH.
 			//
 			//   Root cause: each source returns different subtitle URLs/tracks.
 			//   Switching sources required HLS.js to remove old tracks + add new
 			//   ones. If track indices changed or old tracks weren't fully cleaned,
 			//   HLS.js threw (fatal error = "failed to play").
 			//
-			//   By using ONE canonical set (from SubDL, same for all streams),
-			//   subtitle tracks are identical regardless of source/quality →
-			//   player never rebuilds tracks → no crash.
+			//   By using ONE canonical set (same for all streams), subtitle tracks
+			//   are identical regardless of source/quality → player never rebuilds
+			//   tracks → no crash.
 			var canonicalSubs = [];
 			if (externalSubs && externalSubs.length > 0) {
 				for (var ei = 0; ei < externalSubs.length; ei++) {
