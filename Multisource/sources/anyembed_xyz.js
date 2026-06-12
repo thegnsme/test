@@ -68,7 +68,6 @@ var {
 	safeJsonParse,
 	extractJsValue,
 	qualityLabel,
-	qualityRank,
 	m3u8ToStreams,
 	parseM3U8AllQualities,
 	extractSubtitlesFromM3U8,
@@ -293,11 +292,10 @@ async function fetchStreamSources(tmdbId, type, season, episode, token) {
  *
  * @param {string} streamUrl - The playlist URL from API source (raw vixcloud URL)
  * @param {object} headers - Headers from API response (Origin, Referer)
- * @returns {Promise<{content: string|null, proxyUrl: string|null}>}
- *   Object with raw M3U8 content and the proxy URL to use as master playlist.
+ * @returns {Promise<string|null>} Raw M3U8 content or null
  */
 async function fetchProxiedPlaylist(streamUrl, headers) {
-	if (!streamUrl) return { content: null, proxyUrl: null };
+	if (!streamUrl) return null;
 
 	try {
 		// Build proxy URL — this is what the browser does client-side
@@ -327,11 +325,11 @@ async function fetchProxiedPlaylist(streamUrl, headers) {
 		var body = await httpGet(proxyUrl, reqHeaders);
 
 		if (body && body.length > 50 && body.indexOf("#EXTM3U") !== -1) {
-			return { content: body, proxyUrl: proxyUrl };
+			return body;
 		}
-		return { content: null, proxyUrl: null };
+		return null;
 	} catch (e) {
-		return { content: null, proxyUrl: null };
+		return null;
 	}
 }
 
@@ -445,17 +443,11 @@ function streamHeaders(url, sourceHeaders) {
 /**
  * Build final stream array from API response and parsed HLS playlist.
  *
- * CRITICAL: When a master playlist is available, we return the MASTER PLAYLIST
- * URL (not individual variant URLs). The master playlist contains
- * #EXT-X-MEDIA:TYPE=AUDIO group references that let the player select the
- * correct audio track. Individual variant playlists are VIDEO ONLY — they
- * don't include audio segments and playing them results in silent video.
- *
  * @param {object} apiResult - Result from fetchStreamSources
  * @param {string} playlistContent - Raw M3U8 playlist content (or null)
- * @param {string} playlistUrl - The vixcloud master playlist URL (for player)
+ * @param {string} playlistUrl - The playlist URL
  * @param {object} playlistHeaders - Headers for the playlist
- * @returns {Array<{url, quality, headers, subtitles, audio}>}
+ * @returns {Array<{url, quality, headers, subtitles}>}
  */
 function buildStreams(
 	apiResult,
@@ -484,50 +476,43 @@ function buildStreams(
 	}
 
 	if (playlistContent && playlistContent.indexOf("#EXTM3U") !== -1) {
-		// Parse quality variants, subtitle tracks, and audio tracks from M3U8.
-		// Use playlistUrl (vixcloud CDN URL) as base for resolving relative URLs.
+		// Parse quality variants, audio, and subtitles from the playlist
 		var variants = parseM3U8AllQualities(playlistContent, playlistUrl);
 		var playlistSubs = parseSubtitleTracks(playlistContent, playlistUrl);
 		var audioTracks = extractAudioTracks(playlistContent, playlistUrl);
 
 		if (variants.length > 0) {
-			// ── Find the highest quality for labeling ──
-			var bestQuality = "Auto";
 			for (var vi = 0; vi < variants.length; vi++) {
-				if (qualityRank(variants[vi].quality) > qualityRank(bestQuality)) {
-					bestQuality = variants[vi].quality;
+				var v = variants[vi];
+				if (seenUrls[v.url]) continue;
+				seenUrls[v.url] = true;
+
+				var s = {
+					url: v.url,
+					quality: v.quality || qualityLabel(v.height || 0),
+					headers: streamHeaders(v.url, playlistHeaders),
+				};
+
+				// Attach subtitles from playlist (more accurate)
+				if (playlistSubs.length > 0) {
+					s.subtitles = playlistSubs;
+				} else if (apiSubtitles.length > 0) {
+					s.subtitles = apiSubtitles;
 				}
+
+				// Attach audio track metadata
+				if (audioTracks.length > 0) {
+					s.audio = audioTracks;
+				}
+
+				streams.push(s);
 			}
 
-			// 🔴 CRITICAL: Return the MASTER PLAYLIST URL, NOT individual variant
-			//    URLs. The master playlist contains AUDIO group references that let
-			//    the player select the correct audio track. Individual variant
-			//    playlists are VIDEO ONLY — the player will play video without audio
-			//    if you pass variant URLs directly. Same fix as lordflix.js.
-			var s = {
-				url: playlistUrl,
-				quality: bestQuality,
-				headers: streamHeaders(playlistUrl, playlistHeaders),
-			};
-
-			// Attach subtitle tracks from playlist (WebVTT URLs from M3U8)
-			if (playlistSubs.length > 0) {
-				s.subtitles = playlistSubs;
-			} else if (apiSubtitles.length > 0) {
-				s.subtitles = apiSubtitles;
-			}
-
-			// Attach audio track metadata for player reference
-			if (audioTracks.length > 0) {
-				s.audio = audioTracks;
-			}
-
-			streams.push(s);
-			return streams;
+			if (streams.length > 0) return streams;
 		}
 	}
 
-	// Fallback: Use API-provided streams directly (no master playlist available)
+	// Fallback: Use API-provided streams directly
 	for (var si2 = 0; si2 < apiResult.sources.length; si2++) {
 		var src2 = apiResult.sources[si2];
 		if (!src2.streams) continue;
@@ -636,19 +621,10 @@ async function scrapeStreams(params) {
 		// ── Step 4: Fetch HLS master playlist through the proxy ──
 		var playlistContent = null;
 		if (firstStream) {
-			var plResult = await fetchProxiedPlaylist(firstStream, firstHeaders);
-			playlistContent = plResult.content;
+			playlistContent = await fetchProxiedPlaylist(firstStream, firstHeaders);
 		}
 
 		// ── Step 5: Build final stream list ──
-		// Use firstStream (the vixcloud master playlist URL with token) as the
-		// stream URL. The player fetches it directly — hls.js parses the master
-		// playlist and discovers all video/audio/subtitle track URLs.
-		//
-		// 🔴 CRITICAL: We MUST return the MASTER PLAYLIST URL, NOT individual
-		//    variant URLs. The master playlist contains #EXT-X-MEDIA:TYPE=AUDIO
-		//    group references that let the player select the correct audio track.
-		//    Individual variant playlists are VIDEO ONLY — no audio segments.
 		var streams = buildStreams(
 			apiResult,
 			playlistContent,
