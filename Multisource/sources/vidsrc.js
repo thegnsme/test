@@ -1,5 +1,4 @@
 "use strict";
-var crypto = require("crypto");
 function safeJsonParse(str) {
   if (!str || typeof str !== "string") return null;
   try {
@@ -16,6 +15,13 @@ function makeFail(src, msg, start) {
     streams: [],
     latency_ms: Date.now() - (start || Date.now()),
   };
+}
+function extractQuality(url) {
+  var u = String(url || "");
+  var m = u.match(/(2160p|1440p|1080p|720p|480p|360p)/i);
+  if (m) return m[1].toLowerCase();
+  if (/\b4k\b/i.test(u)) return "4K";
+  return "";
 }
 async function httpGet(url, headers) {
   var raw = await globalThis.http_get(url, headers || {});
@@ -34,6 +40,63 @@ function resolveRelativeUrl(baseUrl, relativePath) {
     return (originMatch ? originMatch[1] : "") + relativePath;
   }
   return baseUrl.replace(/\/[^/]*$/, "/") + relativePath;
+}
+function strToUtf8Bytes(s) {
+  var out = [];
+  for (var i = 0; i < s.length; i++) {
+    var c = s.charCodeAt(i);
+    if (c < 128) {
+      out.push(c);
+    } else if (c < 2048) {
+      out.push(192 | (c >> 6));
+      out.push(128 | (c & 63));
+    } else {
+      out.push(224 | (c >> 12));
+      out.push(128 | ((c >> 6) & 63));
+      out.push(128 | (c & 63));
+    }
+  }
+  return out;
+}
+function utf8BytesToStr(bytes) {
+  var out = "";
+  for (var i = 0; i < bytes.length; i++) {
+    out += String.fromCharCode(bytes[i]);
+  }
+  return out;
+}
+var B64CHARS =
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+function b64encode(bytes) {
+  var out = "";
+  for (var i = 0; i < bytes.length; i += 3) {
+    var b0 = bytes[i],
+      b1 = bytes[i + 1] || 0,
+      b2 = bytes[i + 2] || 0;
+    out += B64CHARS[b0 >> 2];
+    out += B64CHARS[((b0 << 4) | (b1 >> 4)) & 63];
+    out += i + 1 < bytes.length ? B64CHARS[((b1 << 2) | (b2 >> 6)) & 63] : "=";
+    out += i + 2 < bytes.length ? B64CHARS[b2 & 63] : "=";
+  }
+  return out;
+}
+function b64decode(s) {
+  var map = {};
+  for (var i = 0; i < 64; i++) map[B64CHARS[i]] = i;
+  s = s.replace(/[^A-Za-z0-9+/=]/g, "");
+  var out = [];
+  for (var i = 0; i < s.length; i += 4) {
+    var c0 = map[s[i]] || 0,
+      c1 = map[s[i + 1]] || 0,
+      c2 = map[s[i + 2]],
+      c3 = map[s[i + 3]];
+    out.push((c0 << 2) | (c1 >> 4));
+    if (s[i + 2] && s[i + 2] !== "=" && c2 !== undefined)
+      out.push(((c1 << 4) | (c2 >> 2)) & 255);
+    if (s[i + 3] && s[i + 3] !== "=" && c3 !== undefined)
+      out.push(((c2 << 6) | c3) & 255);
+  }
+  return out;
 }
 var TMDB_KEYS = [
   "68e094699525b18a70bab2f86b1fa706",
@@ -171,7 +234,7 @@ function rc4Transform(keyBytes, dataBytes) {
     s[j] = tmp;
   }
   var k = 0;
-  var result = Buffer.alloc(dataBytes.length);
+  var result = new Array(dataBytes.length);
   for (var n = 0; n < dataBytes.length; n++) {
     j = (j + 1) % 256;
     k = (k + s[j]) % 256;
@@ -183,18 +246,18 @@ function rc4Transform(keyBytes, dataBytes) {
   return result;
 }
 function rc4Slug(data, keyStr) {
-  var keyBytes = Buffer.from(keyStr, "utf-8");
-  var dataBytes = Buffer.from(String(data), "utf-8");
+  var keyBytes = strToUtf8Bytes(keyStr);
+  var dataBytes = strToUtf8Bytes(String(data));
   var enc = rc4Transform(keyBytes, dataBytes);
-  return enc.toString("base64").replace(/[+=]/g, "");
+  return b64encode(enc).replace(/[+=]/g, "");
 }
 function vrfDecrypt(vrfB64url) {
   try {
     var raw = vrfB64url.replace(/-/g, "+").replace(/_/g, "/");
-    var data = Buffer.from(raw, "base64");
-    var keyBytes = Buffer.from(RC4_KEY_DECRYPT, "utf-8");
+    var data = b64decode(raw);
+    var keyBytes = strToUtf8Bytes(RC4_KEY_DECRYPT);
     var dec = rc4Transform(keyBytes, data);
-    var str = dec.toString("utf-8");
+    var str = utf8BytesToStr(dec);
     try {
       str = decodeURIComponent(str);
     } catch (e) {}
@@ -256,8 +319,10 @@ async function tryRcpExtraction(html, embedUrl) {
           8e3,
           "rcp",
         );
-        if (resp && resp.indexOf("m3u8") !== -1)
-          return resp.match(/https?:\/\/[^"'\s]+\.m3u8[^"'\s]*/i)?.[0] || null;
+        if (resp && resp.indexOf("m3u8") !== -1) {
+          var m3u8Match = resp.match(/https?:\/\/[^"'\s]+\.m3u8[^"'\s]*/i);
+          if (m3u8Match) return m3u8Match[0];
+        }
         if (resp && resp.indexOf("/prorcp/") !== -1) {
           var prorcpPart = resp.match(/\/prorcp\/([^"'\s]+)/);
           if (prorcpPart) {
@@ -283,7 +348,7 @@ async function tryRcpExtraction(html, embedUrl) {
   } catch (e) {}
   return null;
 }
-async function parseM3U8Master(content, baseUrl) {
+function parseM3U8Master(content, baseUrl) {
   var streams = [];
   var lines = content.split("\n");
   for (var i = 0; i < lines.length; i++) {
@@ -351,15 +416,15 @@ async function fetchM3u8WithQualities(m3u8Url, referer) {
       "m3u8 fetch",
     );
     if (!content || content.indexOf("#EXTM3U") === -1) {
-      return [{ url: m3u8Url, quality: "Auto" }];
+      return [{ url: m3u8Url, quality: extractQuality(m3u8Url) || "Auto" }];
     }
     if (content.indexOf("#EXT-X-STREAM-INF:") !== -1) {
       var parsed = await parseM3U8Master(content, m3u8Url);
       if (parsed.length > 0) return parsed;
     }
-    return [{ url: m3u8Url, quality: "Auto" }];
+    return [{ url: m3u8Url, quality: extractQuality(m3u8Url) || "Auto" }];
   } catch (e) {
-    return [{ url: m3u8Url, quality: "Auto" }];
+    return [{ url: m3u8Url, quality: extractQuality(m3u8Url) || "Auto" }];
   }
 }
 async function scrapeStreams(params) {
@@ -507,19 +572,20 @@ async function scrapeStreams(params) {
       if (foundHtml) {
         var iframe = extractIframeSrc(foundHtml);
         if (iframe) {
+          var streamUrl =
+            iframe.indexOf("http") === 0
+              ? iframe
+              : resolveRelativeUrl(eUrl, iframe);
           streams.push({
-            url:
-              iframe.indexOf("http") === 0
-                ? iframe
-                : resolveRelativeUrl(eUrl, iframe),
-            quality: "Auto",
+            url: streamUrl,
+            quality: extractQuality(streamUrl) || "Auto",
             headers: { "User-Agent": UA, Referer: eUrl },
           });
         }
       }
       streams.push({
         url: eUrl,
-        quality: "Auto [Embed]",
+        quality: extractQuality(eUrl) || "Auto",
         headers: { "User-Agent": UA, Referer: "https://" + foundDomain + "/" },
       });
     }
@@ -548,19 +614,23 @@ async function scrapeStreams(params) {
           ) {
             var iframe = extractIframeSrc(html);
             if (iframe) {
+              var streamUrl =
+                iframe.indexOf("http") === 0
+                  ? iframe
+                  : resolveRelativeUrl(eUrl, iframe);
               streams.push({
-                url:
-                  iframe.indexOf("http") === 0
-                    ? iframe
-                    : resolveRelativeUrl(eUrl, iframe),
-                quality: "Auto",
+                url: streamUrl,
+                quality: extractQuality(streamUrl) || "Auto",
                 headers: { "User-Agent": UA, Referer: eUrl },
               });
             }
             streams.push({
               url: eUrl,
-              quality: "Auto [Embed]",
-              headers: { "User-Agent": UA, Referer: "https://" + domain + "/" },
+              quality: extractQuality(eUrl) || "Auto",
+              headers: {
+                "User-Agent": UA,
+                Referer: "https://" + domain + "/",
+              },
             });
             break;
           }

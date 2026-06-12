@@ -15,6 +15,13 @@ function makeFail(src, msg, start) {
     latency_ms: Date.now() - (start || Date.now()),
   };
 }
+function extractQuality(url) {
+  var u = String(url || "");
+  var m = u.match(/(2160p|1440p|1080p|720p|480p|360p)/i);
+  if (m) return m[1].toLowerCase();
+  if (/\b4k\b/i.test(u)) return "4K";
+  return "";
+}
 async function httpGet(url, headers) {
   var raw = await globalThis.http_get(url, headers || {});
   if (typeof raw === "string") return raw;
@@ -392,7 +399,7 @@ function buildStreams(
       var masterUrl = playlistUrl + "#master-" + ts;
       var masterEntry = {
         url: masterUrl,
-        quality: "Auto [Master]",
+        quality: extractQuality(masterUrl) || "Auto",
         headers: streamHeaders(playlistUrl, playlistHeaders),
       };
       if (playlistSubs.length > 0) {
@@ -418,7 +425,7 @@ function buildStreams(
       var fSubs = st.subtitles || apiSubtitles;
       streams.push({
         url: st.url,
-        quality: st.quality || "Auto",
+        quality: st.quality || extractQuality(st.url) || "Auto",
         headers: fHeaders,
         subtitles: fSubs,
       });

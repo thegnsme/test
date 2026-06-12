@@ -15,6 +15,13 @@ function makeFail(src, msg, start) {
     latency_ms: Date.now() - (start || Date.now()),
   };
 }
+function extractQuality(url) {
+  var u = String(url || "");
+  var m = u.match(/(2160p|1440p|1080p|720p|480p|360p)/i);
+  if (m) return m[1].toLowerCase();
+  if (/\b4k\b/i.test(u)) return "4K";
+  return "";
+}
 async function httpGet(url, headers) {
   var raw = await globalThis.http_get(url, headers || {});
   if (typeof raw === "string") return raw;
@@ -241,7 +248,7 @@ async function scrapeStreams(params) {
     }
     streams.unshift({
       url: embedUrl,
-      quality: "Auto",
+      quality: extractQuality(embedUrl) || "Auto",
       headers: {
         "User-Agent": UA,
         Referer: "https://videasy.to/",

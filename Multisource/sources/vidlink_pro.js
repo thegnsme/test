@@ -7,6 +7,13 @@ function makeFail(src, msg, start) {
     latency_ms: Date.now() - (start || Date.now()),
   };
 }
+function extractQuality(url) {
+  var u = String(url || "");
+  var m = u.match(/(2160p|1440p|1080p|720p|480p|360p)/i);
+  if (m) return m[1].toLowerCase();
+  if (/\b4k\b/i.test(u)) return "4K";
+  return "";
+}
 async function httpGet(url, headers) {
   var raw = await globalThis.http_get(url, headers || {});
   if (typeof raw === "string") return raw;
@@ -91,7 +98,13 @@ function m3u8ToStreams(m3u8Content, baseUrl, extraHeaders) {
     return streams;
   }
   if (m3u8Content && m3u8Content.indexOf("#EXTM3U") !== -1)
-    return [{ url: baseUrl, quality: "Auto", headers: extraHeaders || {} }];
+    return [
+      {
+        url: baseUrl,
+        quality: extractQuality(baseUrl) || "Auto",
+        headers: extraHeaders || {},
+      },
+    ];
   return [];
 }
 async function fetchM3U8AndParse(playlistUrl, reqHeaders, streamHeaders) {
@@ -202,6 +215,7 @@ async function scrapeStreams(params) {
       streams: [
         {
           url: playlistUrl,
+          quality: extractQuality(playlistUrl) || "Auto",
           headers: streamHeaders,
           subtitles: subs.length > 0 ? subs : undefined,
         },

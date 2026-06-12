@@ -6,6 +6,13 @@ function safeJsonParse(str) {
     return null;
   }
 }
+function extractQuality(url) {
+  var u = String(url || "");
+  var m = u.match(/(2160p|1440p|1080p|720p|480p|360p)/i);
+  if (m) return m[1].toLowerCase();
+  if (/\b4k\b/i.test(u)) return "4K";
+  return "";
+}
 function makeFail(src, msg, start) {
   return {
     source: src,
@@ -168,7 +175,7 @@ async function scrapeStreams(params) {
         } else {
           providerStreams.push({
             url: streamUrl,
-            quality: "Auto",
+            quality: extractQuality(streamUrl) || "Auto",
             headers: {
               "User-Agent": UA,
               Referer: EMBED_BASE + "/",
@@ -220,7 +227,7 @@ async function scrapeStreams(params) {
       streams: [
         {
           url: fallbackUrl,
-          quality: "Auto",
+          quality: extractQuality(fallbackUrl) || "Auto",
           headers: {
             "User-Agent": UA,
             Referer: EMBED_BASE + "/",

@@ -422,7 +422,7 @@ async function queryServer(
         }
         result.push({
           url: s.playlist,
-          quality: "Auto [Master]",
+          quality: extractQuality(s.playlist) || "Auto",
           headers: streamHeaders,
         });
       } else {
