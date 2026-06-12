@@ -81,8 +81,8 @@
 	var MAX_RETRIES = 2;
 	var RETRY_BASE_MS = 1000;
 	var HOME_TIMEOUT = 10000;
-	var LOAD_TV_TIMEOUT = 40000;
-	var LOAD_MOVIE_TIMEOUT = 15000;
+	var LOAD_TIMEOUT = 10000;
+	var STREAMS_TIMEOUT = 10000;
 
 	// ═════════════════════════════════════════════════════════════════════════
 	//  TMDB RESPONSE CACHE (bounded LRU with TTL)
@@ -522,7 +522,6 @@
 				apiType = parsed.api;
 			log("load(" + apiType + " tmdb:" + id + ")");
 
-			var loadBudget = apiType === "tv" ? LOAD_TV_TIMEOUT : LOAD_MOVIE_TIMEOUT;
 			var settled = false;
 
 			function safe(r) {
@@ -554,7 +553,7 @@
 						],
 					}),
 				});
-			}, loadBudget);
+			}, LOAD_TIMEOUT);
 
 			tmdbGet(apiType + "/" + id, {
 				append_to_response: "credits,videos,external_ids",
@@ -855,12 +854,21 @@
 		);
 
 		try {
-			var aggregated = await SOURCES.aggregateAll(
-				params.tmdbId,
-				params.type,
-				params.season,
-				params.episode,
-			);
+			// Race aggregateAll against a timeout — if any source hangs, we
+			// return empty streams instead of crashing the entire player.
+			var aggregated = await Promise.race([
+				SOURCES.aggregateAll(
+					params.tmdbId,
+					params.type,
+					params.season,
+					params.episode,
+				),
+				new Promise(function (_, reject) {
+					setTimeout(function () {
+						reject(new Error("timeout"));
+					}, STREAMS_TIMEOUT);
+				}),
+			]);
 
 			if (!aggregated || !aggregated.sources) {
 				return cb({ success: true, data: [] });
