@@ -53,133 +53,34 @@ var UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36";
 
 // =========================================================================
-//  SKYSTREAM HTTP WRAPPERS (return full response including headers)
+//  SKYSTREAM HTTP WRAPPERS
 // =========================================================================
 
 /**
  * HTTP GET returning full response { body, headers, status }.
- * Uses global http_get (SkyStream runtime), falls back to Node https.
+ * Uses global http_get (SkyStream runtime), available in both Node test
+ * harness and the actual SkyStream runtime.
  */
 async function httpGetRaw(url, reqHeaders) {
-  try {
-    if (typeof globalThis.http_get === "function") {
-      var resp = await globalThis.http_get(url, reqHeaders || {});
-      if (resp && resp.body !== undefined) {
-        return {
-          body: resp.body || "",
-          headers: resp.headers || {},
-          status: resp.status || resp.statusCode || 0,
-        };
-      }
-    }
-  } catch (_) {
-    // fall through to Node fallback
-  }
-  return nodeHttpGet(url, reqHeaders);
+  var resp = await globalThis.http_get(url, reqHeaders || {});
+  return {
+    body: resp.body || "",
+    headers: resp.headers || {},
+    status: resp.status || resp.statusCode || 0,
+  };
 }
 
 /**
  * HTTP POST returning full response { body, headers, status }.
- * Uses global http_post (SkyStream runtime), falls back to Node https.
+ * Uses global http_post (SkyStream runtime).
  */
 async function httpPostRaw(url, reqHeaders, body) {
-  try {
-    if (typeof globalThis.http_post === "function") {
-      var resp = await globalThis.http_post(url, reqHeaders || {}, body || "");
-      if (resp && resp.body !== undefined) {
-        return {
-          body: resp.body || "",
-          headers: resp.headers || {},
-          status: resp.status || resp.statusCode || 0,
-        };
-      }
-    }
-  } catch (_) {
-    // fall through to Node fallback
-  }
-  return nodeHttpPost(url, reqHeaders, body);
-}
-
-/**
- * Node.js fallback for HTTP GET with headers.
- */
-function nodeHttpGet(url, headers) {
-  return new Promise(function (resolve) {
-    var parsed = require("url").parse(url);
-    var lib = parsed.protocol === "https:" ? require("https") : require("http");
-    var opts = {
-      hostname: parsed.hostname,
-      port: parsed.port || (parsed.protocol === "https:" ? 443 : 80),
-      path: parsed.path + (parsed.hash || ""),
-      method: "GET",
-      headers: headers || {},
-      timeout: 30000,
-    };
-    var req = lib.request(opts, function (r) {
-      var d = "";
-      r.on("data", function (c) {
-        d += c;
-      });
-      r.on("end", function () {
-        resolve({
-          body: d,
-          headers: r.headers || {},
-          status: r.statusCode || 0,
-        });
-      });
-    });
-    req.on("error", function () {
-      resolve({ body: "", headers: {}, status: 0 });
-    });
-    req.on("timeout", function () {
-      req.destroy();
-      resolve({ body: "", headers: {}, status: 0 });
-    });
-    req.end();
-  });
-}
-
-/**
- * Node.js fallback for HTTP POST with headers.
- */
-function nodeHttpPost(url, headers, body) {
-  return new Promise(function (resolve) {
-    var parsed = require("url").parse(url);
-    var lib = parsed.protocol === "https:" ? require("https") : require("http");
-    var bodyBuf = Buffer.from(body || "", "utf8");
-    var opts = {
-      hostname: parsed.hostname,
-      port: parsed.port || (parsed.protocol === "https:" ? 443 : 80),
-      path: parsed.path + (parsed.hash || ""),
-      method: "POST",
-      headers: Object.assign({}, headers || {}, {
-        "Content-Length": bodyBuf.length,
-      }),
-      timeout: 30000,
-    };
-    var req = lib.request(opts, function (r) {
-      var d = "";
-      r.on("data", function (c) {
-        d += c;
-      });
-      r.on("end", function () {
-        resolve({
-          body: d,
-          headers: r.headers || {},
-          status: r.statusCode || 0,
-        });
-      });
-    });
-    req.on("error", function () {
-      resolve({ body: "", headers: {}, status: 0 });
-    });
-    req.on("timeout", function () {
-      req.destroy();
-      resolve({ body: "", headers: {}, status: 0 });
-    });
-    req.write(bodyBuf);
-    req.end();
-  });
+  var resp = await globalThis.http_post(url, reqHeaders || {}, body || "");
+  return {
+    body: resp.body || "",
+    headers: resp.headers || {},
+    status: resp.status || resp.statusCode || 0,
+  };
 }
 
 // =========================================================================
