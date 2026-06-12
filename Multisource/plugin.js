@@ -18,18 +18,26 @@
  *    • Quality auto-detection from URL when source omits it
  *    • Streams sorted: highest quality first, then alphabetically by source
  *
- *  🔴 SUBTITLE ARCHITECTURE (CRITICAL):
- *    Subtitles MUST be assigned to StreamResult objects AFTER construction,
- *    NOT as part of the constructor. The StreamResult constructor may strip
- *    unknown fields including `subtitles`. All reference plugins (netmirror,
- *    cinestream, cinemacity) follow this pattern:
+ *  🔴 SUBTITLE ARCHITECTURE (3 CRITICAL RULES):
  *
- *      var sr = new StreamResult({ url, source, headers, quality });
- *      sr.subtitles = mergedSubtitles;  // ← AFTER constructor
+ *    1. StreamResult constructor strips subtitles
+ *       Assign subtitles AFTER construction, NOT in the constructor:
+ *         var sr = new StreamResult({ url, source, headers, quality });
+ *         sr.subtitles = mergedSubtitles;  // ← AFTER constructor
  *
- *    Each stream receives its OWN deep-cloned subtitle array — never share
- *    a single array reference across streams. Player subtitle toggling on
- *    one stream must not corrupt others.
+ *    2. Deep-clone subtitle arrays per stream
+ *       Never share the same array reference across streams. Player toggling
+ *       on one stream must not corrupt others.
+ *
+ *    3. ALL streams MUST use the SAME canonical subtitle set
+ *       🔴 THIS PREVENTS HLS CRASHES ON SOURCE/QUALITY SWITCH.
+ *       Each source returns different subtitle URLs. If streams have different
+ *       subtitle tracks, the player must REMOVE old tracks and ADD new ones on
+ *       source/quality switch → HLS.js FATAL ERROR.
+ *
+ *       FIX: Use external SubDL subtitles as ONE canonical set for ALL streams
+ *       (same languages, same order, same URLs). Player never rebuilds tracks
+ *       on switch → no crash. Source subs used only as SubDL fallback.
  *
  *  URL SCHEME:
  *    Movie:  nuvio://movie/{tmdbId}
@@ -944,6 +952,40 @@
 			// ── Build StreamResult objects ──
 			// 🔴 FIX: Create StreamResult WITHOUT subtitles, then assign AFTER.
 			var streamResults = [];
+
+			// ═══ BUILD CANONICAL SUBTITLE SET (source-independent) ═══
+			// 🔴 KEY FIX: Use SubDL subtitles as the canonical set for ALL streams.
+			//   When ALL streams have IDENTICAL subtitle tracks, the player never
+			//   needs to rebuild them on source/quality switch → NO HLS CRASH.
+			//
+			//   Root cause: each source returns different subtitle URLs/tracks.
+			//   Switching sources required HLS.js to remove old tracks + add new
+			//   ones. If track indices changed or old tracks weren't fully cleaned,
+			//   HLS.js threw (fatal error = "failed to play").
+			//
+			//   By using ONE canonical set (from SubDL, same for all streams),
+			//   subtitle tracks are identical regardless of source/quality →
+			//   player never rebuilds tracks → no crash.
+			var canonicalSubs = [];
+			if (externalSubs && externalSubs.length > 0) {
+				for (var ei = 0; ei < externalSubs.length; ei++) {
+					var ext = externalSubs[ei];
+					if (!ext || !ext.url) continue;
+					var norm =
+						SUBTITLE_PROVIDER.normalizeSubtitle &&
+						SUBTITLE_PROVIDER.normalizeSubtitle(ext);
+					if (!norm) {
+						norm = {
+							url: ext.url,
+							name: ext.label || ext.name || ext.lang || "Subtitle",
+							label: ext.label || ext.name || ext.lang || "Subtitle",
+							lang: ext.lang || "en",
+						};
+					}
+					if (norm && norm.url) canonicalSubs.push(norm);
+				}
+			}
+
 			for (var si = 0; si < all.length; si++) {
 				var obj = all[si];
 				delete obj._qr;
@@ -951,61 +993,54 @@
 				// Step 1: Create StreamResult WITHOUT subtitles
 				var sr = new StreamResult(obj);
 
-				// Step 2: Build merged subtitle list (deep-cloned per-stream)
+				// Step 2: Build merged subtitle list
 				var mergedSubs = [];
 
-				// 2a: Add source-provided subtitles (deep-cloned)
-				var srcSubs = sourceSubsList[si];
-				if (srcSubs && srcSubs.length > 0) {
-					var cloneFn =
-						SUBTITLE_PROVIDER.cloneSubtitles ||
-						function (arr) {
-							return arr
-								? arr
-										.map(function (x) {
-											return x
-												? {
-														url: x.url,
-														name: x.name || x.label || x.lang || "Subtitle",
-														label: x.label || x.name || x.lang || "Subtitle",
-														lang: x.lang || "en",
-													}
-												: null;
-										})
-										.filter(Boolean)
-								: [];
-						};
-					mergedSubs = cloneFn(srcSubs);
-				}
-
-				// 2b: Add external subtitles (dedup by URL, normalize format)
-				if (externalSubs && externalSubs.length > 0) {
-					var existingUrls = {};
-					for (var ei = 0; ei < mergedSubs.length; ei++) {
-						if (mergedSubs[ei] && mergedSubs[ei].url) {
-							existingUrls[mergedSubs[ei].url] = true;
-						}
-					}
-					for (var ei2 = 0; ei2 < externalSubs.length; ei2++) {
-						var ext = externalSubs[ei2];
-						if (!ext || !ext.url) continue;
-						// Skip if this subtitle URL is already in the list
-						if (existingUrls[ext.url]) continue;
-						existingUrls[ext.url] = true;
-
-						// Normalize to include both `name` and `label`
-						var norm =
-							SUBTITLE_PROVIDER.normalizeSubtitle &&
-							SUBTITLE_PROVIDER.normalizeSubtitle(ext);
-						if (!norm) {
-							norm = {
-								url: ext.url,
-								name: ext.label || ext.name || ext.lang || "Subtitle",
-								label: ext.label || ext.name || ext.lang || "Subtitle",
-								lang: ext.lang || "en",
+				if (canonicalSubs.length > 0) {
+					// 🔴 KEY FIX: Use canonical SubDL subtitles — SAME set for ALL
+					// streams so subtitle tracks are stable across switches.
+					// Deep-clone so each stream has its own array (prevents
+					// corruption if player mutates one stream's subtitles).
+					mergedSubs =
+						SUBTITLE_PROVIDER.cloneSubtitles &&
+						SUBTITLE_PROVIDER.cloneSubtitles(canonicalSubs);
+					if (!mergedSubs || mergedSubs.length === 0) {
+						mergedSubs = canonicalSubs.map(function (x) {
+							return {
+								url: x.url,
+								name: x.name,
+								label: x.label,
+								lang: x.lang,
 							};
-						}
-						mergedSubs.push(norm);
+						});
+					}
+				} else {
+					// No external subs available — fall back to source-provided
+					// subtitles (per-stream, only when canonical subs are empty).
+					// Source subs vary per source, so switching may still cause
+					// subtitle track rebuild, but with no external subs available
+					// this is the best we can do.
+					var srcSubs = sourceSubsList[si];
+					if (srcSubs && srcSubs.length > 0) {
+						var cloneFn =
+							SUBTITLE_PROVIDER.cloneSubtitles ||
+							function (arr) {
+								return arr
+									? arr
+											.map(function (x) {
+												return x
+													? {
+															url: x.url,
+															name: x.name || x.label || x.lang || "Subtitle",
+															label: x.label || x.name || x.lang || "Subtitle",
+															lang: x.lang || "en",
+														}
+													: null;
+											})
+											.filter(Boolean)
+									: [];
+							};
+						mergedSubs = cloneFn(srcSubs);
 					}
 				}
 
