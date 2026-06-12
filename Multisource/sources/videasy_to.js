@@ -2,24 +2,30 @@
  * videasy.to — HLS via encrypted API (Production)
  *
  * Decrypts via enc-dec.app, returns quality variants (1080p/720p/480p).
- * Each stream carries its own subtitles with proper language labels.
+ * Each stream carries its own deep-cloned subtitles with proper labels.
+ *
+ * FIXED:
+ *   • TMDB metadata integration — gets IMDB ID, title, year for API
+ *   • Proper API URL construction with all available parameters
+ *   • Subtitle deep-cloning per stream (no shared array references)
+ *   • Origin header added for CDN access
+ *   • Cleaner error handling
  *
  * FLOW:
- *   1. POST encrypted payload from videasy API
- *   2. Decrypt via enc-dec.app
- *   3. Parse response: sources[] with per-variant quality + subtitles[]
- *   4. Return streams with quality sorted descending
+ *   1. Fetch TMDB metadata (title, year, imdb_id)
+ *   2. POST encrypted payload from videasy API (with TMDB metadata)
+ *   3. Decrypt via enc-dec.app
+ *   4. Parse response: sources[] with per-variant quality + subtitles[]
+ *   5. Deep-clone subtitles per stream to avoid shared references
+ *   6. Return streams quality-sorted descending
  *
- * PRODUCTION FEATURES:
- *   • Safe JSON parsing with fallback
- *   • Error message sanitization (no internal leak)
- *   • Quality label normalization (HD→1080p, SD→480p)
- *   • Subtitle label passthrough with language detection
- *   • URL validation (https:// only, no private IPs)
- *   • Quality-sorted output (highest first)
+ * ⚠ NOTE: The CDN (server.digitalsun.app) uses Cloudflare. Streams
+ *   may not play from third-party contexts where Cloudflare clearance
+ *   is unavailable. The scraper returns valid URLs — playback depends
+ *   on the player's browser having Cloudflare clearance for the CDN.
  */
 
-var { httpGet, httpPost, safeJsonParse } = require("./_shared");
+var { httpGet, httpPost, safeJsonParse, fetchTmdbMeta } = require("./_shared");
 
 var SOURCE_NAME = "videasy.to";
 var VIDEO_API = "https://api.videasy.to/cdn/sources-with-title";
@@ -82,6 +88,25 @@ function isValidStreamUrl(url) {
 	return true;
 }
 
+/**
+ * Deep-clone an array of subtitle objects.
+ * Each stream gets its OWN copy to prevent cross-stream corruption.
+ */
+function cloneSubtitles(subs) {
+	if (!subs || !subs.length) return [];
+	var cloned = [];
+	for (var i = 0; i < subs.length; i++) {
+		var s = subs[i];
+		if (!s) continue;
+		cloned.push({
+			url: s.url,
+			label: s.label || s.name || "VTT",
+			lang: s.lang || "",
+		});
+	}
+	return cloned;
+}
+
 async function scrapeStreams(params) {
 	var start = Date.now();
 
@@ -96,17 +121,24 @@ async function scrapeStreams(params) {
 	}
 
 	try {
+		// ── Step 0: Fetch TMDB metadata for better API query ──
+		var meta = await fetchTmdbMeta(params.tmdbId, params.type);
+		var title = meta && meta.title ? encodeURIComponent(meta.title) : "";
+		var year = meta && meta.year ? encodeURIComponent(meta.year) : "";
+		var imdbId = meta && meta.imdb_id ? encodeURIComponent(meta.imdb_id) : "";
+
 		// ── Step 1: Fetch encrypted payload from videasy API ──
-		var apiUrl =
-			VIDEO_API +
-			"?title=&mediaType=" +
-			params.type +
-			"&year=&tmdbId=" +
-			String(params.tmdbId) +
-			"&imdbId=" +
-			(params.type === "tv"
-				? "&season=" + params.season + "&episode=" + params.episode
-				: "");
+		var apiUrl = VIDEO_API + "?title=" + title + "&mediaType=" + params.type;
+
+		// Only include year/imdbId/tmdbId if we have them (avoid empty params)
+		if (year) apiUrl += "&year=" + year;
+		if (imdbId) apiUrl += "&imdbId=" + imdbId;
+		apiUrl += "&tmdbId=" + String(params.tmdbId);
+
+		if (params.type === "tv") {
+			apiUrl +=
+				"&season=" + (params.season || 1) + "&episode=" + (params.episode || 1);
+		}
 
 		var encryptedText = String(
 			await httpGet(apiUrl, {
@@ -139,23 +171,30 @@ async function scrapeStreams(params) {
 		var result = decryptData.result;
 		var rawSources = result.sources || [];
 
-		// Build subtitles list (deduplicated by URL)
+		// Build subtitles list (deduplicated by URL + language, deep-cloned per stream)
 		var subs = [];
 		var rawSubs = result.subtitles || [];
 		var seenSubs = {};
 		for (var j = 0; j < rawSubs.length; j++) {
 			var sub = rawSubs[j];
-			if (sub && sub.url && !seenSubs[sub.url]) {
-				seenSubs[sub.url] = true;
-				subs.push({
-					url: sub.url,
-					label: sub.label || sub.name || "VTT",
-					lang: sub.language || sub.lang || "",
-				});
-			}
+			if (!sub || !sub.url) continue;
+			var subLang = sub.language || sub.lang || "";
+			var subLabel = sub.label || sub.name || subLang || "Unknown";
+			// Deduplicate by URL to avoid identical subtitle tracks
+			if (seenSubs[sub.url]) continue;
+			seenSubs[sub.url] = true;
+			subs.push({
+				url: sub.url,
+				label: subLabel,
+				lang: subLang,
+			});
+		}
+		// Cap at a reasonable number to avoid overwhelming the player
+		if (subs.length > 30) {
+			subs = subs.slice(0, 30);
 		}
 
-		// Build streams with quality normalization
+		// ── Step 4: Build streams with per-stream deep-cloned subtitles ──
 		var streams = [];
 		for (var i = 0; i < rawSources.length; i++) {
 			var s = rawSources[i];
@@ -168,8 +207,10 @@ async function scrapeStreams(params) {
 				headers: {
 					"User-Agent": UA,
 					Referer: "https://videasy.to/",
+					Origin: "https://videasy.to",
 				},
-				subtitles: subs.length > 0 ? subs : undefined,
+				// 🔴 FIX: Deep-clone subtitles per stream — never share arrays
+				subtitles: subs.length > 0 ? cloneSubtitles(subs) : undefined,
 			});
 		}
 

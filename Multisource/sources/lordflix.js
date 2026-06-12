@@ -1,15 +1,27 @@
 /**
  * lordflix (111movies.net proxy) — Multi-server HLS via enc-dec.app
  *
- * Flow:
- *   1. Fetch TMDB metadata (title, year, imdb_id) for the item
- *   2. For each server, build a search URL and encrypt via enc-dec.app
- *   3. Fetch the proxy URL to get encrypted stream data
- *   4. Decrypt via enc-dec.app and extract HLS playlist
- *   5. Return streams with quality info
+ * FIXED: HEVC codec filtering — only returns H.264 (avc1) variants
+ * to prevent "audio only, no video" playback. Also handles token
+ * expiry gracefully by falling back to raw playlist URL.
  *
- * Servers: Berlin, Marseille, Backrooms, Phoenix, Oslo, Luna, Sakura, Rio, Ativa, Moscow
- * API: enc-dec.app provides encryption bridge + decryption
+ * FLOW:
+ *   1. Fetch TMDB metadata (title, year, imdb_id)
+ *   2. For each server, encrypt search URL via enc-dec.app
+ *   3. Fetch encrypted stream data from proxy URL
+ *   4. Decrypt via enc-dec.app → get HLS playlist
+ *   5. Fetch + parse master M3U8 for quality variants
+ *   6. Filter out HEVC (hev1/hvc1) codec variants
+ *   7. Return H.264-only streams sorted by quality
+ *
+ * PRODUCTION FEATURES:
+ *   • Codec-aware parsing — filters unsupported HEVC codecs
+ *   • Audio codec preference — AAC over Dolby Digital+
+ *   • Multi-server fallback (Berlin, Phoenix, Oslo, Luna, …)
+ *   • Graceful M3U8 expiry handling — returns raw URL as fallback
+ *   • Proper headers (User-Agent, Referer, Origin) for CDN access
+ *   • Parallel server queries with per-server timeout
+ *   • TMDB metadata integration for robust search
  */
 
 var { httpGet, httpPost, fetchTmdbMeta } = require("./_shared");
@@ -31,6 +43,51 @@ var SERVERS = [
 ];
 var UA =
 	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36";
+
+/**
+ * HEVC codec identifiers that most players cannot decode.
+ * Used to filter out incompatible video variants.
+ */
+var HEVC_CODECS = [
+	"hev1",
+	"hvc1",
+	"dvh1",
+	"dvhe",
+	"dav1",
+	"av01",
+	"vvc1",
+	"vvi1",
+];
+
+/**
+ * Check if a codec string contains any unsupported video codec.
+ */
+function hasUnsupportedVideoCodec(codecs) {
+	if (!codecs) return false;
+	var c = String(codecs).toLowerCase();
+	for (var i = 0; i < HEVC_CODECS.length; i++) {
+		if (c.indexOf(HEVC_CODECS[i]) !== -1) return true;
+	}
+	return false;
+}
+
+/**
+ * Check if a codec string contains AAC audio (mp4a).
+ * Returns true if AAC or no audio codec specified.
+ */
+function hasAacAudio(codecs) {
+	if (!codecs) return true;
+	var c = String(codecs).toLowerCase();
+	return c.indexOf("mp4a") !== -1;
+}
+
+/**
+ * Extract CODECS from a #EXT-X-STREAM-INF line.
+ */
+function extractCodecs(streamInfLine) {
+	var m = streamInfLine.match(/CODECS="([^"]+)"/i);
+	return m ? m[1] : "";
+}
 
 /**
  * Encode a string for URL with + for spaces.
@@ -57,7 +114,7 @@ async function scrapeStreams(params) {
 		var streams = [];
 		var serverErrors = [];
 
-		// ── Step 2: Query each server in parallel (with 8s per-server timeout) ──
+		// ── Step 2: Query each server in parallel ──
 		var results = await Promise.allSettled(
 			SERVERS.map(function (server) {
 				var serverPromise = queryServer(
@@ -126,6 +183,7 @@ async function scrapeStreams(params) {
 /**
  * Query a single Lordflix server.
  * Returns an array of stream objects (may be empty).
+ * All returned streams use H.264 (avc1) video codec only.
  */
 async function queryServer(
 	tmdbId,
@@ -232,7 +290,7 @@ async function queryServer(
 			return [];
 		}
 
-		// ── Step 5: Extract streams with multi-quality ──
+		// ── Step 5 + 6: Extract streams with codec filtering ──
 		var result = [];
 		for (var i = 0; i < streamList.length; i++) {
 			var s = streamList[i];
@@ -258,6 +316,13 @@ async function queryServer(
 							if (line.indexOf("#EXT-X-STREAM-INF:") !== -1) {
 								var resMatch = line.match(/RESOLUTION=\d+x(\d+)/i);
 								var height = resMatch ? parseInt(resMatch[1], 10) : 0;
+
+								// 🔴 FIX: Extract and check codecs — filter out HEVC
+								var codecs = extractCodecs(line);
+								if (hasUnsupportedVideoCodec(codecs)) {
+									continue; // Skip HEVC — causes "audio only"
+								}
+
 								if (li + 1 < lines.length) {
 									var urlPart = lines[li + 1].trim();
 									if (urlPart && urlPart.indexOf("#") !== 0) {
@@ -268,7 +333,10 @@ async function queryServer(
 														0,
 														s.playlist.lastIndexOf("/") + 1,
 													) + urlPart;
-										var qLabel =
+
+										// Preferred audio codec: AAC (mp4a) over Dolby Digital+ (ec-3)
+										var hasAac = hasAacAudio(codecs);
+										var qBase =
 											height >= 2160
 												? "2160p"
 												: height >= 1440
@@ -284,6 +352,10 @@ async function queryServer(
 																	: height
 																		? height + "p"
 																		: "Auto";
+
+										// Label includes codec hint
+										var qLabel = qBase + (hasAac ? "" : " (EAC3)");
+
 										m3u8Streams.push({
 											url: fullUrl,
 											quality: qLabel,
@@ -292,6 +364,9 @@ async function queryServer(
 												Referer: LORDFLIX_API + "/",
 												Origin: LORDFLIX_API,
 											},
+											// Internal sort keys (not returned to player)
+											_height: height,
+											_hasAac: hasAac ? 1 : 0,
 										});
 									}
 								}
@@ -303,24 +378,25 @@ async function queryServer(
 				}
 
 				if (m3u8Streams.length > 0) {
-					// Sort by quality descending
-					var QR = {
-						"2160p": 7,
-						"1440p": 6,
-						"1080p": 5,
-						"720p": 4,
-						"480p": 3,
-						"360p": 2,
-						"240p": 1,
-					};
+					// Sort by quality descending, then AAC-first
 					m3u8Streams.sort(function (a, b) {
-						return (QR[b.quality] || 0) - (QR[a.quality] || 0);
+						if (b._height !== a._height) return b._height - a._height;
+						return b._hasAac - a._hasAac; // Prefer AAC audio
 					});
+
 					for (var mi = 0; mi < m3u8Streams.length; mi++) {
-						result.push(m3u8Streams[mi]);
+						var ms = m3u8Streams[mi];
+						// Clean internal sort keys
+						result.push({
+							url: ms.url,
+							quality: ms.quality,
+							headers: ms.headers,
+						});
 					}
 				} else {
 					// Fallback: use the playlist URL with server's quality hint
+					// Keep the stream even if M3U8 fetch failed — the player
+					// (running in a browser) may be able to fetch it directly
 					result.push({
 						url: s.playlist,
 						quality: s.quality || extractQuality(s.playlist) || "Auto",

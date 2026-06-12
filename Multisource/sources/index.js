@@ -35,6 +35,9 @@ var SOURCES_REGISTRY = {
 	"vidsrc.xyz": require("./vidsrc_xyz"),
 	ezvidapi: require("./ezvidapi"),
 	"apiplayer.ru": require("./apiplayer_ru"),
+	// ═══ anyembed.xyz — API-based multi-quality HLS with subtitles ════
+	"anyembed.xyz": require("./anyembed_xyz"),
+	// ═════════════════════════════════════════════════════════════════════
 	// ═══ REMOVED: broken sources ═══════════════════════════════════════
 	// 2embed.cc      — site blocks requests ("embed page empty")
 	// superembed.stream — same backend as multiembed.mov, both blocked
@@ -57,8 +60,8 @@ var HEALTH_RESET_AFTER = 300000; // 5 min cooldown for unhealthy sources
 
 // Per-source timeout overrides (for known slow sources)
 var SOURCE_TIMEOUT_OVERRIDES = {
-	lordflix: 45000, // 10 parallel servers, each makes 4 requests → generous but capped
-	"mappletv.uk": 25000, // VidFast multi-step chain
+	lordflix: 45000, // 10 parallel servers, each makes 4 requests
+	"anyembed.xyz": 30000, // API auth + provider fallback chain
 	ezvidapi: 20000, // API-based multi-provider with M3U8 fetch
 };
 
