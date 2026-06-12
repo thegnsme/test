@@ -85,30 +85,54 @@
 
 		// Streamtape token expiry buffer (seconds)
 		ST_EXPIRY_BUFFER: 5 * 60, // 5 min before actual expiry, refresh
+
+		// HTTP timeout (ms) — prevents http_get from hanging forever
+		HTTP_TIMEOUT: 15000, // 15s per request
+
+		// Max cache entries (LRU eviction)
+		CACHE_MAX: 50,
+
+		// Global loadStreams timeout (ms) — always calls cb within this window
+		LOADSTREAMS_TIMEOUT: 45000, // 45s
 	};
 
 	// ============================================================
-	// 3. MEMORY CACHE (TTL-based)
+	// 3. MEMORY CACHE (TTL-based + LRU max entries)
 	// ============================================================
 	var _cache = Object.create(null);
-	var _cacheTimers = Object.create(null);
+	var _cacheKeys = []; // insertion order for LRU eviction
 
 	function cacheGet(key) {
 		var entry = _cache[key];
 		if (!entry) return null;
 		if (Date.now() > entry.expires) {
 			delete _cache[key];
+			var idx = _cacheKeys.indexOf(key);
+			if (idx !== -1) _cacheKeys.splice(idx, 1);
 			return null;
+		}
+		// Move to end (most recently used)
+		var idx = _cacheKeys.indexOf(key);
+		if (idx !== -1) {
+			_cacheKeys.splice(idx, 1);
+			_cacheKeys.push(key);
 		}
 		return entry.data;
 	}
 
 	function cacheSet(key, data, ttlMs) {
+		// Evict LRU if at capacity
+		if (_cacheKeys.length >= CONFIG.CACHE_MAX && !_cache[key]) {
+			var oldest = _cacheKeys.shift();
+			delete _cache[oldest];
+		}
 		_cache[key] = { data: data, expires: Date.now() + ttlMs };
+		if (_cacheKeys.indexOf(key) === -1) _cacheKeys.push(key);
 	}
 
 	function cacheClear() {
 		_cache = Object.create(null);
+		_cacheKeys = [];
 	}
 
 	// ============================================================
@@ -151,8 +175,24 @@
 	}
 
 	// ============================================================
-	// 5. HTTP FETCH with retry + circuit breaker + cache
+	// 5. HTTP FETCH with retry + circuit breaker + cache + timeout
 	// ============================================================
+	/**
+	 * Race an HTTP request against a timeout promise.
+	 * If timeout wins, the promise is rejected (the underlying http_get
+	 * may still complete but its result is discarded).
+	 */
+	function httpGetWithTimeout(url, options) {
+		return Promise.race([
+			http_get(url, options || {}),
+			new Promise(function (_, reject) {
+				setTimeout(function () {
+					reject(new Error("HTTP_TIMEOUT " + CONFIG.HTTP_TIMEOUT + "ms"));
+				}, CONFIG.HTTP_TIMEOUT);
+			}),
+		]);
+	}
+
 	async function httpGetCached(url, options, ttlMs) {
 		var cacheKey = "http|" + url;
 		var cached = cacheGet(cacheKey);
@@ -185,7 +225,7 @@
 
 		for (var attempt = 0; attempt <= retries; attempt++) {
 			try {
-				var res = await http_get(url, options || {});
+				var res = await httpGetWithTimeout(url, options);
 
 				if (res && res.status === 200) {
 					cbSuccess(host);
@@ -834,8 +874,48 @@
 	// ============================================================
 	async function loadStreams(url, cb) {
 		var startTime = Date.now();
+		var cbCalled = false;
+
+		// Ensure cb is only called once, with a safety timeout
+		function safeCb(data) {
+			if (cbCalled) return;
+			cbCalled = true;
+			cb(data);
+		}
+
+		// Global safety timeout — ensures the player never hangs
+		var safetyTimer = setTimeout(function () {
+			LOG.warn("loadStreams safety timeout fired", {
+				url: url ? url.substring(0, 80) : "nil",
+				elapsed: Date.now() - startTime + "ms",
+			});
+			safeCb({
+				success: true,
+				data: [
+					new StreamResult({
+						url: url,
+						quality: "Auto",
+						source: "Auto",
+						headers: {
+							"User-Agent": CONFIG.USER_AGENT,
+							Referer: CONFIG.REFERER,
+						},
+					}),
+				],
+			});
+		}, CONFIG.LOADSTREAMS_TIMEOUT);
+
 		try {
-			if (!url) return cb({ success: true, data: [] });
+			if (!url) {
+				clearTimeout(safetyTimer);
+				return safeCb({ success: true, data: [] });
+			}
+
+			// ── Reset circuit breaker state for a fresh start ──
+			// Each movie gets its own chance without being blocked by
+			// failures from the previous movie.
+			_cbState = Object.create(null);
+			LOG.debug("Circuit breaker reset for new loadStreams call");
 
 			var streams = [];
 			var host = hostFromUrl(url);
@@ -906,10 +986,12 @@
 				duration: dur + "ms",
 			});
 
-			cb({ success: true, data: final });
+			clearTimeout(safetyTimer);
+			safeCb({ success: true, data: final });
 		} catch (e) {
+			clearTimeout(safetyTimer);
 			LOG.error("loadStreams fatal", { err: e.message });
-			cb({
+			safeCb({
 				success: true,
 				data: [
 					new StreamResult({
@@ -1253,10 +1335,13 @@
 	// ============================================================
 	async function morenciusExtractHls(fid, streams) {
 		try {
-			var eRes = await http_get("https://morencius.com/embed/" + fid, {
-				"User-Agent": CONFIG.USER_AGENT,
-				Referer: "https://morencius.com/",
-			});
+			var eRes = await httpGetWithTimeout(
+				"https://morencius.com/embed/" + fid,
+				{
+					"User-Agent": CONFIG.USER_AGENT,
+					Referer: "https://morencius.com/",
+				},
+			);
 			if (!eRes || eRes.status !== 200) return false;
 
 			var html = eRes.body;
