@@ -1,66 +1,115 @@
-/**
- * mapple.uk — Multi-server 4K HLS via Mapple Encryption API
- *
- * =============================================================================
- *  ARCHITECTURE
- * =============================================================================
- *  Mapple is a free streaming platform at mapple.uk that provides direct HLS
- *  streams through an encrypted API. It offers 5 server sources:
- *
- *    s1 (Lyra / Mapple 4K) — Direct HLS via encryption API  ← THIS SOURCE
- *    s2 (Luna / vidfast.pro) — External iframe embed (Next.js, no API)
- *    s3 (Aspen / vidlink.pro) — External iframe embed (vidlink_pro.js)
- *    s4 (Pulse / videasy.net) — External iframe embed (videasy_to.js)
- *    s5 (Nova / vidsrc.cc) — External iframe embed (vidsrc.cc, Cloudflare)
- *
- *  This source implements the s1 (Mapple 4K) extraction via the internal
- *  Mapple Encryption API, which returns direct M3U8 master playlist URLs.
- *
- *  EXTRACTION FLOW:
- *    1. Fetch the watch page HTML → extract __REQUEST_TOKEN__ JWT + _mapple_site cookie
- *    2. POST /api/encrypt with { data: {mediaId, mediaType, tv_slug, source}, endpoint, requestToken }
- *    3. Parse response → get encrypted API URL (/api/stream-encrypted?data=...&apikey=...)
- *    4. Fetch the encrypted URL with requestToken → get { success, data: { stream_url } }
- *    5. stream_url is a master M3U8 playlist on source.heistotron.uk
- *    6. Parse the master M3U8 → extract all quality variants
- *
- *  M3U8 RESPONSE (master playlist with 3 quality tiers):
- *    #EXTM3U
- *    #EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=8000000,RESOLUTION=1920x1080
- *    https://source.heistotron.uk/p/<variant_token>   ← 1080p
- *    #EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=4500000,RESOLUTION=1280x720
- *    https://source.heistotron.uk/p/<variant_token>   ← 720p
- *    #EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=2200000,RESOLUTION=640x360
- *    https://source.heistotron.uk/p/<variant_token>   ← 360p
- *
- *  ERROR HANDLING:
- *    • Token extraction failure → re-fetch page with retry
- *    • API 400/500 → return empty streams (graceful degradation)
- *    • M3U8 parse failure → return single stream from URL directly
- *    • Cookie expiry → re-fetch page on each scrapeStreams call
- *    • All errors classified and logged via shared helpers
- *
- *  USAGE (via plugin.js → sources/index.js):
- *    skystream test -p . -f getStreams -q '{"id":"550","type":"movie"}'
- * =============================================================================
- */
-
-var { safeJsonParse, fetchM3U8AndParse, makeFail } = require("./_shared");
+function safeJsonParse(str) {
+  if (!str || typeof str !== "string") return null;
+  try {
+    return JSON.parse(str);
+  } catch (e) {
+    return null;
+  }
+}
+function makeFail(src, msg, start) {
+  return {
+    source: src,
+    status: "error",
+    error: msg || "unknown",
+    streams: [],
+    latency_ms: Date.now() - (start || Date.now()),
+  };
+}
+function qualityLabel(h) {
+  if (h >= 2160) return "2160p";
+  if (h >= 1440) return "1440p";
+  if (h >= 1080) return "1080p";
+  if (h >= 720) return "720p";
+  if (h >= 480) return "480p";
+  if (h >= 360) return "360p";
+  return h ? h + "p" : "Auto";
+}
+function resolveRelativeUrl(baseUrl, relativePath) {
+  if (!baseUrl) return relativePath;
+  if (relativePath.indexOf("//") === 0) return "https:" + relativePath;
+  if (relativePath.indexOf("/") === 0) {
+    var originMatch = baseUrl.match(/^(https?:\/\/[^/]+)/);
+    return (originMatch ? originMatch[1] : "") + relativePath;
+  }
+  return baseUrl.replace(/\/[^/]*$/, "/") + relativePath;
+}
+function copyHeaders(obj) {
+  if (!obj || typeof obj !== "object") return {};
+  var out = {};
+  for (var k in obj) {
+    if (Object.prototype.hasOwnProperty.call(obj, k))
+      if (obj[k] != null) out[k] = obj[k];
+  }
+  return out;
+}
+function parseM3U8AllQualities(m3u8Content, baseUrl) {
+  if (!m3u8Content || m3u8Content.indexOf("#EXTM3U") === -1) return [];
+  var lines = m3u8Content.split("\n");
+  var results = [];
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i];
+    if (line.indexOf("#EXT-X-STREAM-INF:") !== -1) {
+      var resMatch = line.match(/RESOLUTION=\d+x(\d+)/i);
+      var height = resMatch ? parseInt(resMatch[1], 10) : 0;
+      if (i + 1 < lines.length) {
+        var urlPart = lines[i + 1].trim();
+        if (urlPart && urlPart.indexOf("#") !== 0) {
+          var fullUrl =
+            urlPart.indexOf("http") === 0
+              ? urlPart
+              : resolveRelativeUrl(baseUrl, urlPart);
+          results.push({
+            url: fullUrl,
+            quality: qualityLabel(height),
+            height: height,
+          });
+        }
+      }
+    }
+  }
+  results.sort(function (a, b) {
+    return b.height - a.height;
+  });
+  return results;
+}
+function m3u8ToStreams(m3u8Content, baseUrl, extraHeaders) {
+  var variants = parseM3U8AllQualities(m3u8Content, baseUrl);
+  if (variants.length > 0) {
+    var streams = [];
+    for (var vi = 0; vi < variants.length; vi++) {
+      var v = variants[vi];
+      var stream = {
+        url: v.url,
+        quality: v.quality,
+        headers: copyHeaders(extraHeaders),
+      };
+      if (baseUrl && (!stream.headers.Referer || stream.headers.Referer === ""))
+        stream.headers.Referer = baseUrl;
+      streams.push(stream);
+    }
+    return streams;
+  }
+  if (m3u8Content && m3u8Content.indexOf("#EXTM3U") !== -1)
+    return [{ url: baseUrl, quality: "Auto", headers: extraHeaders || {} }];
+  return [];
+}
+async function fetchM3U8AndParse(playlistUrl, reqHeaders, streamHeaders) {
+  try {
+    var resp = await httpGetRaw(playlistUrl, reqHeaders || {});
+    if (!resp.body || resp.body.length < 20) return [];
+    return m3u8ToStreams(resp.body, playlistUrl, streamHeaders || reqHeaders);
+  } catch (e) {
+    return [];
+  }
+}
 
 var SOURCE_NAME = "mapple.uk";
+
 var BASE_URL = "https://mapple.uk";
+
 var UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36";
 
-// =========================================================================
-//  SKYSTREAM HTTP WRAPPERS
-// =========================================================================
-
-/**
- * HTTP GET returning full response { body, headers, status }.
- * Uses global http_get (SkyStream runtime), available in both Node test
- * harness and the actual SkyStream runtime.
- */
 async function httpGetRaw(url, reqHeaders) {
   var resp = await globalThis.http_get(url, reqHeaders || {});
   return {
@@ -70,10 +119,6 @@ async function httpGetRaw(url, reqHeaders) {
   };
 }
 
-/**
- * HTTP POST returning full response { body, headers, status }.
- * Uses global http_post (SkyStream runtime).
- */
 async function httpPostRaw(url, reqHeaders, body) {
   var resp = await globalThis.http_post(url, reqHeaders || {}, body || "");
   return {
@@ -83,15 +128,6 @@ async function httpPostRaw(url, reqHeaders, body) {
   };
 }
 
-// =========================================================================
-//  BUILD WATCH PAGE URL
-// =========================================================================
-
-/**
- * Build the watch page URL for a given media item.
- * Movie:  https://mapple.uk/watch/movie/{tmdbId}
- * TV:     https://mapple.uk/watch/tv/{tmdbId}-{season}-{episode}
- */
 function buildWatchUrl(tmdbId, type, season, episode) {
   if (type === "tv" && season != null && episode != null) {
     return BASE_URL + "/watch/tv/" + tmdbId + "-" + season + "-" + episode;
@@ -99,33 +135,19 @@ function buildWatchUrl(tmdbId, type, season, episode) {
   return BASE_URL + "/watch/movie/" + tmdbId;
 }
 
-// =========================================================================
-//  MAIN SCRAPE FUNCTION
-// =========================================================================
-
-/**
- * Scrape streams from mapple.uk using the encryption API.
- * Returns ALL quality variants from the master M3U8 playlist.
- */
 async function scrapeStreams(params) {
   var start = Date.now();
   var tmdbId = String(params.tmdbId);
   var type = params.type || "movie";
   var season = params.season;
   var episode = params.episode;
-
   try {
-    // =====================================================================
-    // Step 1: Fetch watch page → extract __REQUEST_TOKEN__ + _mapple_site cookie
-    // =====================================================================
     var watchUrl = buildWatchUrl(tmdbId, type, season, episode);
-
     var pageResp = await httpGetRaw(watchUrl, {
       "User-Agent": UA,
       Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
       "Accept-Language": "en-US,en;q=0.5",
     });
-
     if (!pageResp.body || pageResp.status !== 200) {
       return makeFail(
         SOURCE_NAME,
@@ -133,11 +155,8 @@ async function scrapeStreams(params) {
         start,
       );
     }
-
-    // Extract __REQUEST_TOKEN__ from <script> block
     var tokenMatch = pageResp.body.match(/__REQUEST_TOKEN__\s*=\s*"([^"]+)"/);
     var requestToken = tokenMatch ? tokenMatch[1] : null;
-
     if (!requestToken) {
       return makeFail(
         SOURCE_NAME,
@@ -145,8 +164,6 @@ async function scrapeStreams(params) {
         start,
       );
     }
-
-    // Extract _mapple_site cookie from Set-Cookie response header
     var cookie = "";
     if (pageResp.headers && pageResp.headers["set-cookie"]) {
       var rawCookies = pageResp.headers["set-cookie"];
@@ -156,15 +173,10 @@ async function scrapeStreams(params) {
         cookie = String(rawCookies);
       }
     }
-
-    // =====================================================================
-    // Step 2: POST /api/encrypt → get encrypted stream URL
-    // =====================================================================
     var tvSlug = "";
     if (type === "tv" && season != null && episode != null) {
       tvSlug = String(season) + "-" + String(episode);
     }
-
     var encryptPayload = JSON.stringify({
       data: {
         mediaId: tmdbId,
@@ -175,7 +187,6 @@ async function scrapeStreams(params) {
       endpoint: "stream-encrypted",
       requestToken: requestToken,
     });
-
     var encryptResp = await httpPostRaw(
       BASE_URL + "/api/encrypt",
       {
@@ -187,7 +198,6 @@ async function scrapeStreams(params) {
       },
       encryptPayload,
     );
-
     if (!encryptResp.body || encryptResp.status !== 200) {
       return makeFail(
         SOURCE_NAME,
@@ -195,27 +205,19 @@ async function scrapeStreams(params) {
         start,
       );
     }
-
     var encData = safeJsonParse(encryptResp.body);
     if (!encData || !encData.url) {
       return makeFail(SOURCE_NAME, "encryption API returned no URL", start);
     }
-
-    // =====================================================================
-    // Step 3: Fetch the encrypted stream info → get actual M3U8 URL
-    // =====================================================================
     var encryptedUrl = encData.url;
     if (encryptedUrl.indexOf("http") !== 0) {
       encryptedUrl = BASE_URL + encryptedUrl;
     }
-
-    // Append requestToken if the API requires it
     if (encryptedUrl.indexOf("requestToken") === -1) {
       var sep = encryptedUrl.indexOf("?") === -1 ? "?" : "&";
       encryptedUrl =
         encryptedUrl + sep + "requestToken=" + encodeURIComponent(requestToken);
     }
-
     var streamInfoResp = await httpGetRaw(encryptedUrl, {
       "User-Agent": UA,
       Accept: "application/json",
@@ -223,7 +225,6 @@ async function scrapeStreams(params) {
       Referer: watchUrl,
       Cookie: cookie,
     });
-
     if (!streamInfoResp.body || streamInfoResp.status !== 200) {
       return makeFail(
         SOURCE_NAME,
@@ -231,7 +232,6 @@ async function scrapeStreams(params) {
         start,
       );
     }
-
     var streamInfo = safeJsonParse(streamInfoResp.body);
     if (
       !streamInfo ||
@@ -245,26 +245,17 @@ async function scrapeStreams(params) {
         start,
       );
     }
-
     var m3u8Url = streamInfo.data.stream_url;
-
-    // =====================================================================
-    // Step 4: Fetch M3U8 master playlist → extract ALL quality variants
-    // =====================================================================
     var m3u8Headers = {
       "User-Agent": UA,
       Origin: BASE_URL,
       Referer: BASE_URL + "/",
     };
-
     var streamHeaders = {
       Referer: BASE_URL + "/",
       Origin: BASE_URL,
     };
-
     var streams = await fetchM3U8AndParse(m3u8Url, m3u8Headers, streamHeaders);
-
-    // If M3U8 parsing gave us quality variants, return them
     if (streams.length > 0) {
       return {
         source: SOURCE_NAME,
@@ -273,8 +264,6 @@ async function scrapeStreams(params) {
         latency_ms: Date.now() - start,
       };
     }
-
-    // Fallback: return the M3U8 URL as a single Auto-quality stream
     return {
       source: SOURCE_NAME,
       status: "working",
@@ -294,10 +283,6 @@ async function scrapeStreams(params) {
     return makeFail(SOURCE_NAME, e.message || String(e), start);
   }
 }
-
-// =========================================================================
-//  EXPORTS
-// =========================================================================
 
 module.exports = {
   name: SOURCE_NAME,
