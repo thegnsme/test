@@ -27,7 +27,14 @@
  * =============================================================================
  */
 
-var { httpGet, makeFail } = require("./_shared");
+var {
+	httpGet,
+	makeFail,
+	parseM3U8AllQualities,
+	m3u8ToStreams,
+	qualityLabel,
+	resolveRelativeUrl,
+} = require("./_shared");
 
 var SOURCE_NAME = "vidsrc.xyz";
 var DOMAINS_URL = "https://vidsrc.domains/";
@@ -267,6 +274,7 @@ async function tryRcpChain(embedHtml, embedUrl) {
 
 /**
  * Process a PRORCP endpoint and return M3U8 streams.
+ * Fetches the resolved M3U8 URL and parses it for ALL quality variants.
  */
 async function processProrcp(prorcpUrl, refererUrl) {
 	try {
@@ -306,16 +314,11 @@ async function processProrcp(prorcpUrl, refererUrl) {
 			}
 		}
 
-		return [
-			{
-				url: fileUrl,
-				quality: "Auto",
-				headers: {
-					"User-Agent": UA,
-					Referer: prorcpUrl,
-				},
-			},
-		];
+		// Fetch and parse the resolved M3U8 URL for ALL quality variants
+		return await fetchM3U8AndParseAllVariants(fileUrl, {
+			"User-Agent": UA,
+			Referer: prorcpUrl,
+		});
 	} catch (e) {
 		return [];
 	}
@@ -323,6 +326,8 @@ async function processProrcp(prorcpUrl, refererUrl) {
 
 /**
  * Process a SRCRCP endpoint and return M3U8 streams.
+ * Fetches the resolved M3U8 URL and parses it for ALL quality variants.
+ * Also adds the master playlist as "Auto [Master]" option.
  */
 async function processSrcrcp(srcrcpPath, baseDom, refererUrl) {
 	try {
@@ -338,12 +343,28 @@ async function processSrcrcp(srcrcpPath, baseDom, refererUrl) {
 		// Check for Turnstile
 		if (hasTurnstile(scriptContent)) return [];
 
-		// Direct M3U8 content
+		// Direct M3U8 content embedded in script response.
+		// The M3U8 contains variant URLs (CDN). No separate master URL exists —
+		// the variants are the real stream endpoints and should work directly.
 		if (scriptContent.indexOf("#EXTM3U") !== -1) {
-			return parseM3u8Variants(scriptContent, srcrcpUrl);
+			var variants = parseM3u8Variants(scriptContent, srcrcpUrl);
+			if (variants.length > 0) {
+				return variants;
+			}
+			// Valid M3U8 but no STREAM-INF → variant playlist (single quality)
+			return [
+				{
+					url: srcrcpUrl,
+					quality: extractQualityFromUrl(srcrcpUrl) || "Auto",
+					headers: {
+						"User-Agent": UA,
+						Referer: srcrcpUrl,
+					},
+				},
+			];
 		}
 
-		// Extract file URL
+		// Extract file URL from script
 		var fileMatch = scriptContent.match(/file['"]?\s*[:=]\s*['"]([^'"]+)['"]/i);
 		var fileUrl = "";
 		if (fileMatch && fileMatch[1]) {
@@ -368,16 +389,11 @@ async function processSrcrcp(srcrcpPath, baseDom, refererUrl) {
 			}
 		}
 
-		return [
-			{
-				url: fileUrl,
-				quality: "Auto",
-				headers: {
-					"User-Agent": UA,
-					Referer: srcrcpUrl,
-				},
-			},
-		];
+		// Fetch and parse the resolved M3U8 URL for ALL quality variants
+		return await fetchM3U8AndParseAllVariants(fileUrl, {
+			"User-Agent": UA,
+			Referer: srcrcpUrl,
+		});
 	} catch (e) {
 		return [];
 	}
@@ -385,37 +401,25 @@ async function processSrcrcp(srcrcpPath, baseDom, refererUrl) {
 
 /**
  * Parse M3U8 content and return quality variants.
+ * Uses shared _shared.js parser for consistency.
  */
 function parseM3u8Variants(content, baseUrl) {
+	// Use the shared parser, then enrich with headers
+	var variants = parseM3U8AllQualities(content, baseUrl);
+	if (variants.length === 0) return [];
+
 	var results = [];
-	var lines = String(content).split("\n");
-
-	for (var i = 0; i < lines.length; i++) {
-		var line = lines[i];
-		if (line.indexOf("#EXT-X-STREAM-INF:") !== -1) {
-			var resMatch = line.match(/RESOLUTION=\d+x(\d+)/i);
-			var height = resMatch ? parseInt(resMatch[1], 10) : 0;
-
-			if (i + 1 < lines.length) {
-				var urlPart = lines[i + 1].trim();
-				if (urlPart && urlPart.indexOf("#") !== 0) {
-					var fullUrl =
-						urlPart.indexOf("http") === 0
-							? urlPart
-							: baseUrl.replace(/\/[^/]*$/, "/") + urlPart;
-
-					results.push({
-						url: fullUrl,
-						quality: qualityLabel(height),
-						height: height,
-						headers: {
-							"User-Agent": UA,
-							Referer: baseUrl,
-						},
-					});
-				}
-			}
-		}
+	for (var vi = 0; vi < variants.length; vi++) {
+		var v = variants[vi];
+		results.push({
+			url: v.url,
+			quality: v.quality,
+			height: v.height,
+			headers: {
+				"User-Agent": UA,
+				Referer: baseUrl,
+			},
+		});
 	}
 
 	results.sort(function (a, b) {
@@ -425,14 +429,67 @@ function parseM3u8Variants(content, baseUrl) {
 	return results;
 }
 
-function qualityLabel(height) {
-	if (height >= 2160) return "2160p";
-	if (height >= 1440) return "1440p";
-	if (height >= 1080) return "1080p";
-	if (height >= 720) return "720p";
-	if (height >= 480) return "480p";
-	if (height >= 360) return "360p";
-	return height ? height + "p" : "Auto";
+/**
+ * Fetch a M3U8 URL, parse it, and return ALL quality variants as streams
+ * plus a master playlist entry. Falls back to returning the URL as-is
+ * if M3U8 parsing fails or the content is a variant playlist.
+ *
+ * @param {string} url - The M3U8 URL
+ * @param {object} headers - Headers to use for fetching
+ * @returns {Promise<Array<{url, quality, headers}>>}
+ */
+async function fetchM3U8AndParseAllVariants(url, headers) {
+	if (!url) return [];
+
+	try {
+		var m3u8Content = await httpGet(url, headers || {});
+		if (!m3u8Content || m3u8Content.indexOf("#EXTM3U") === -1) {
+			// Not valid M3U8 — return URL as single Auto stream
+			return [{ url: url, quality: "Auto", headers: headers || {} }];
+		}
+
+		// Try to parse as master playlist with STREAM-INF variants
+		var variants = parseM3U8AllQualities(m3u8Content, url);
+		if (variants.length > 0) {
+			// Master playlist — return ALL individual variant streams
+			// Each with its own variant URL AND audio group reference
+			// (vixcloud/etc variants are video-only, but vidsrc variants
+			//  typically have muxed audio so direct URLs work)
+			var streams = [];
+			for (var vi = 0; vi < variants.length; vi++) {
+				streams.push({
+					url: variants[vi].url,
+					quality: variants[vi].quality,
+					headers: headers || {},
+				});
+			}
+			// Also add master playlist as "Auto [Master]" for proper HLS
+			streams.push({
+				url: url,
+				quality: "Auto [Master]",
+				headers: headers || {},
+			});
+			return streams;
+		}
+
+		// It's a variant playlist (single quality) — extract quality from URL
+		var q = extractQualityFromUrl(url) || "Auto";
+		return [{ url: url, quality: q, headers: headers || {} }];
+	} catch (e) {
+		// Fetch failed — return URL as-is
+		return [{ url: url, quality: "Auto", headers: headers || {} }];
+	}
+}
+
+/**
+ * Extract resolution label from a URL string.
+ */
+function extractQualityFromUrl(url) {
+	var u = String(url || "");
+	var m = u.match(/(2160p|1440p|1080p|720p|480p|360p)/i);
+	if (m) return m[1];
+	if (/\b4k\b/i.test(u)) return "2160p";
+	return "";
 }
 
 // =============================================================================
@@ -489,18 +546,20 @@ async function scrapeStreams(params) {
 					continue;
 				}
 
-				// Strategy 1: Direct M3U8 extraction
+				// Strategy 1: Direct M3U8 extraction — fetch and parse for variants
 				var directStreams = extractDirectM3u8(embedHtml, embedUrl);
 				if (directStreams.length > 0) {
 					for (var si = 0; si < directStreams.length; si++) {
-						streams.push({
-							url: directStreams[si].url,
-							quality: directStreams[si].quality,
-							headers: {
+						var parsed = await fetchM3U8AndParseAllVariants(
+							directStreams[si].url,
+							{
 								"User-Agent": UA,
 								Referer: embedUrl,
 							},
-						});
+						);
+						for (var pi = 0; pi < parsed.length; pi++) {
+							streams.push(parsed[pi]);
+						}
 					}
 					// Success — no need to try more domains
 					break;

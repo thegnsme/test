@@ -491,38 +491,58 @@ function buildStreams(
 		var audioTracks = extractAudioTracks(playlistContent, playlistUrl);
 
 		if (variants.length > 0) {
-			// ── Find the highest quality for labeling ──
-			var bestQuality = "Auto";
+			// ── Return ALL quality variants as individual stream entries ──
+			//
+			// IMPORTANT: For vixcloud-hosted playlists, individual variant playlists
+			// are VIDEO ONLY — audio comes from a separate #EXT-X-MEDIA:TYPE=AUDIO
+			// group. If we pass variant URLs directly, hls.js plays video with no
+			// audio. Therefore, ALL variant entries point to the MASTER playlist URL.
+			// hls.js uses the master playlist's bandwidth detection to auto-select
+			// the optimal variant while maintaining audio context.
+			//
+			// To prevent plugin.js dedup (which removes duplicate URLs), each entry
+			// gets a unique URL fragment (#1080p, #720p, etc.). Fragments are not
+			// sent in HTTP requests, so the server returns the same master playlist.
+			var ts = Date.now();
 			for (var vi = 0; vi < variants.length; vi++) {
-				if (qualityRank(variants[vi].quality) > qualityRank(bestQuality)) {
-					bestQuality = variants[vi].quality;
+				var v = variants[vi];
+				var vUrl = playlistUrl + "#" + v.quality + "-" + ts;
+				var entry = {
+					url: vUrl,
+					quality: v.quality,
+					headers: streamHeaders(playlistUrl, playlistHeaders),
+				};
+				// Attach subtitle tracks from playlist (WebVTT URLs from M3U8)
+				if (playlistSubs.length > 0) {
+					entry.subtitles = playlistSubs;
+				} else if (apiSubtitles.length > 0) {
+					entry.subtitles = apiSubtitles;
 				}
+				// Attach audio track metadata for player reference
+				if (audioTracks.length > 0) {
+					entry.audio = audioTracks;
+				}
+				streams.push(entry);
 			}
 
-			// 🔴 CRITICAL: Return the MASTER PLAYLIST URL, NOT individual variant
-			//    URLs. The master playlist contains AUDIO group references that let
-			//    the player select the correct audio track. Individual variant
-			//    playlists are VIDEO ONLY — the player will play video without audio
-			//    if you pass variant URLs directly. Same fix as lordflix.js.
-			var s = {
-				url: playlistUrl,
-				quality: bestQuality,
+			// Also add the master playlist as "Auto [Master]" for proper HLS
+			// with audio group references and in-player quality switching
+			var masterUrl = playlistUrl + "#master-" + ts;
+			var masterEntry = {
+				url: masterUrl,
+				quality: "Auto [Master]",
 				headers: streamHeaders(playlistUrl, playlistHeaders),
 			};
-
-			// Attach subtitle tracks from playlist (WebVTT URLs from M3U8)
 			if (playlistSubs.length > 0) {
-				s.subtitles = playlistSubs;
+				masterEntry.subtitles = playlistSubs;
 			} else if (apiSubtitles.length > 0) {
-				s.subtitles = apiSubtitles;
+				masterEntry.subtitles = apiSubtitles;
 			}
-
-			// Attach audio track metadata for player reference
 			if (audioTracks.length > 0) {
-				s.audio = audioTracks;
+				masterEntry.audio = audioTracks;
 			}
+			streams.push(masterEntry);
 
-			streams.push(s);
 			return streams;
 		}
 	}
