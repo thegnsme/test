@@ -111,30 +111,15 @@ var SERVERS = [
 var UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36";
 
-var HEVC_CODECS = [
-  "hev1",
-  "hvc1",
-  "dvh1",
-  "dvhe",
-  "dav1",
-  "av01",
-  "vvc1",
-  "vvi1",
-];
-
-function hasUnsupportedVideoCodec(codecs) {
-  if (!codecs) return false;
-  var c = String(codecs).toLowerCase();
-  for (var i = 0; i < HEVC_CODECS.length; i++) {
-    if (c.indexOf(HEVC_CODECS[i]) !== -1) return true;
-  }
-  return false;
-}
-
-function hasAacAudio(codecs) {
-  if (!codecs) return true;
-  var c = String(codecs).toLowerCase();
-  return c.indexOf("mp4a") !== -1;
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise(function (_, reject) {
+      setTimeout(function () {
+        reject(new Error((label || "request") + " timeout"));
+      }, ms);
+    }),
+  ]);
 }
 
 function extractCodecs(streamInfLine) {
@@ -176,7 +161,7 @@ async function scrapeStreams(params) {
         );
         var perServerTimeout = new Promise(function (_, reject) {
           setTimeout(function () {
-            reject(new Error(server + " timeout (8s)"));
+            reject(new Error(server + " timeout (12s)"));
           }, 12e3);
         });
         return Promise.race([serverPromise, perServerTimeout]);
@@ -245,14 +230,15 @@ async function queryServer(
     if (type === "tv") {
       serverUrl += "&season=" + season + "&episode=" + episode;
     }
-    var encResp = await httpGet(
-      ENC_DEC_API + "/enc-lordflix?url=" + enc(serverUrl),
-      {
+    var encResp = await withTimeout(
+      httpGet(ENC_DEC_API + "/enc-lordflix?url=" + enc(serverUrl), {
         "User-Agent": UA,
         Accept: "application/json",
         Origin: "https://lordflix.org",
         Referer: "https://lordflix.org/",
-      },
+      }),
+      8e3,
+      server + " encrypt",
     );
     var encData;
     try {
@@ -268,25 +254,33 @@ async function queryServer(
     if (!proxyUrl || !signature) {
       return [];
     }
-    var encryptedData = await httpGet(proxyUrl, {
-      "User-Agent": UA,
-      Accept: "*/*",
-      Referer: LORDFLIX_API + "/",
-      Origin: LORDFLIX_API,
-    });
+    var encryptedData = await withTimeout(
+      httpGet(proxyUrl, {
+        "User-Agent": UA,
+        Accept: "*/*",
+        Referer: LORDFLIX_API + "/",
+        Origin: LORDFLIX_API,
+      }),
+      8e3,
+      server + " proxy",
+    );
     if (!encryptedData || encryptedData.length < 10) {
       return [];
     }
-    var decResp = await httpPost(
-      ENC_DEC_API + "/dec-lordflix",
-      {
-        "Content-Type": "application/json",
-        "User-Agent": UA,
-      },
-      JSON.stringify({
-        text: encryptedData,
-        sign: signature,
-      }),
+    var decResp = await withTimeout(
+      httpPost(
+        ENC_DEC_API + "/dec-lordflix",
+        {
+          "Content-Type": "application/json",
+          "User-Agent": UA,
+        },
+        JSON.stringify({
+          text: encryptedData,
+          sign: signature,
+        }),
+      ),
+      8e3,
+      server + " decrypt",
     );
     var decData;
     try {
@@ -421,15 +415,8 @@ async function queryServer(
           var label = ve.quality;
           if (ve.codecLabel) label += " [" + ve.codecLabel + "]";
           result.push({
-            url: ve.url,
+            url: s.playlist + "#" + ve.quality + "-" + Date.now(),
             quality: label,
-            headers: streamHeaders,
-          });
-        }
-        if (audioEntry) {
-          result.push({
-            url: audioEntry.url,
-            quality: "Audio [" + audioEntry.label + "]",
             headers: streamHeaders,
           });
         }
