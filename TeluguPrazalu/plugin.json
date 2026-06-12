@@ -1,0 +1,10 @@
+{
+	"packageName": "com.teluguprazalu.streams",
+	"name": "TeluguPrazalu",
+	"version": 1,
+	"baseUrl": "https://teluguprazalu.com",
+	"description": "TeluguPrazalu — scraper for Telugu, Hollywood-dubbed & Bollywood-dubbed movies from teluguprazalu.com",
+	"authors": ["thegnsme"],
+	"languages": ["te"],
+	"categories": ["Movies"]
+}
