@@ -238,7 +238,6 @@ async function testSource(name) {
 async function main() {
 	await testSource("lordflix");
 	await testSource("videasy_to");
-	await testSource("vidsrc_xyz");
 
 	var totalMs = Date.now() - totalStart;
 	console.log("═══════════════════════════════════════════");

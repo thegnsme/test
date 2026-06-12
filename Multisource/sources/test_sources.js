@@ -90,41 +90,12 @@ async function testVideasy() {
 	console.log("");
 }
 
-// ── vidsrc.xyz ──
-async function testVidsrc() {
-	console.log("═══ vidsrc.xyz ═══");
-	try {
-		var src = require("./vidsrc_xyz");
-		var start = Date.now();
-		var result = await src.scrapeStreams(params);
-		var ms = Date.now() - start;
-		console.log("  Status:", result.status);
-		console.log("  Error:", result.error || "(none)");
-		console.log("  Streams:", (result.streams || []).length);
-		console.log("  Latency:", ms + "ms");
-		for (var i = 0; i < (result.streams || []).length && i < 10; i++) {
-			var s = result.streams[i];
-			console.log(
-				"    [" +
-					(i + 1) +
-					"] " +
-					(s.quality || "?") +
-					"  url=" +
-					(s.url || "").substring(0, 80) +
-					"...",
-			);
-		}
-	} catch (e) {
-		console.log("  CRASHED:", e.message);
-	}
-	console.log("");
-}
+// ═══ REMOVED: vidsrc.xyz — all .ru/.su domains behind Cloudflare Turnstile ═══
 
 // ── Run all ──
 async function main() {
 	await testLordflix();
 	await testVideasy();
-	await testVidsrc();
 	console.log("=== All tests complete ===");
 }
 
