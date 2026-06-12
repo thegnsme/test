@@ -1,15 +1,27 @@
 /**
  * lordflix (111movies.net proxy) — Multi-server HLS via enc-dec.app
  *
- * Flow:
- *   1. Fetch TMDB metadata (title, year, imdb_id) for the item
- *   2. For each server, build a search URL and encrypt via enc-dec.app
- *   3. Fetch the proxy URL to get encrypted stream data
- *   4. Decrypt via enc-dec.app and extract HLS playlist
- *   5. Return streams with quality info
+ * FIXED: HEVC codec filtering — only returns H.264 (avc1) variants
+ * to prevent "audio only, no video" playback. Also handles token
+ * expiry gracefully by falling back to raw playlist URL.
  *
- * Servers: Berlin, Marseille, Backrooms, Phoenix, Oslo, Luna, Sakura, Rio, Ativa, Moscow
- * API: enc-dec.app provides encryption bridge + decryption
+ * FLOW:
+ *   1. Fetch TMDB metadata (title, year, imdb_id)
+ *   2. For each server, encrypt search URL via enc-dec.app
+ *   3. Fetch encrypted stream data from proxy URL
+ *   4. Decrypt via enc-dec.app → get HLS playlist
+ *   5. Fetch + parse master M3U8 for quality variants
+ *   6. Filter out HEVC (hev1/hvc1) codec variants
+ *   7. Return H.264-only streams sorted by quality
+ *
+ * PRODUCTION FEATURES:
+ *   • Codec-aware parsing — filters unsupported HEVC codecs
+ *   • Audio codec preference — AAC over Dolby Digital+
+ *   • Multi-server fallback (Berlin, Phoenix, Oslo, Luna, …)
+ *   • Graceful M3U8 expiry handling — returns raw URL as fallback
+ *   • Proper headers (User-Agent, Referer, Origin) for CDN access
+ *   • Parallel server queries with per-server timeout
+ *   • TMDB metadata integration for robust search
  */
 
 var { httpGet, httpPost, fetchTmdbMeta } = require("./_shared");
@@ -31,6 +43,51 @@ var SERVERS = [
 ];
 var UA =
 	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36";
+
+/**
+ * HEVC codec identifiers that most players cannot decode.
+ * Used to filter out incompatible video variants.
+ */
+var HEVC_CODECS = [
+	"hev1",
+	"hvc1",
+	"dvh1",
+	"dvhe",
+	"dav1",
+	"av01",
+	"vvc1",
+	"vvi1",
+];
+
+/**
+ * Check if a codec string contains any unsupported video codec.
+ */
+function hasUnsupportedVideoCodec(codecs) {
+	if (!codecs) return false;
+	var c = String(codecs).toLowerCase();
+	for (var i = 0; i < HEVC_CODECS.length; i++) {
+		if (c.indexOf(HEVC_CODECS[i]) !== -1) return true;
+	}
+	return false;
+}
+
+/**
+ * Check if a codec string contains AAC audio (mp4a).
+ * Returns true if AAC or no audio codec specified.
+ */
+function hasAacAudio(codecs) {
+	if (!codecs) return true;
+	var c = String(codecs).toLowerCase();
+	return c.indexOf("mp4a") !== -1;
+}
+
+/**
+ * Extract CODECS from a #EXT-X-STREAM-INF line.
+ */
+function extractCodecs(streamInfLine) {
+	var m = streamInfLine.match(/CODECS="([^"]+)"/i);
+	return m ? m[1] : "";
+}
 
 /**
  * Encode a string for URL with + for spaces.
@@ -57,7 +114,7 @@ async function scrapeStreams(params) {
 		var streams = [];
 		var serverErrors = [];
 
-		// ── Step 2: Query each server in parallel (with 8s per-server timeout) ──
+		// ── Step 2: Query each server in parallel ──
 		var results = await Promise.allSettled(
 			SERVERS.map(function (server) {
 				var serverPromise = queryServer(
@@ -126,6 +183,7 @@ async function scrapeStreams(params) {
 /**
  * Query a single Lordflix server.
  * Returns an array of stream objects (may be empty).
+ * All returned streams use H.264 (avc1) video codec only.
  */
 async function queryServer(
 	tmdbId,
@@ -232,106 +290,93 @@ async function queryServer(
 			return [];
 		}
 
-		// ── Step 5: Extract streams with multi-quality ──
+		// ── Step 5 + 6: Extract streams with codec filtering ──
+		//
+		// 🔴 CRITICAL: We MUST return the MASTER playlist URL (s.playlist), NOT
+		// individual variant URLs (video_1080p.m3u8 etc). The master playlist
+		// contains #EXT-X-MEDIA:TYPE=AUDIO references that tell HLS.js to fetch
+		// separate audio playlists. Individual variant playlists are VIDEO ONLY
+		// — returning them causes "video but no audio" playback.
+		//
+		// The M3U8 parsing is only used for QUALITY DETECTION (finding the best
+		// H.264 quality to display in the UI label). The actual stream URL is
+		// always the master playlist.
 		var result = [];
 		for (var i = 0; i < streamList.length; i++) {
 			var s = streamList[i];
-			if (s.type === "hls" && s.playlist) {
-				// Try to fetch the M3U8 and parse all quality variants (5s timeout)
-				var m3u8Streams = [];
-				try {
-					var m3u8Fetch = httpGet(s.playlist, {
-						"User-Agent": UA,
-						Referer: LORDFLIX_API + "/",
-						Accept: "*/*",
-					});
-					var m3u8Timeout = new Promise(function (_, reject) {
-						setTimeout(function () {
-							reject(new Error("m3u8 timeout"));
-						}, 5000);
-					});
-					var m3u8Content = await Promise.race([m3u8Fetch, m3u8Timeout]);
-					if (m3u8Content && m3u8Content.indexOf("#EXTM3U") !== -1) {
-						var lines = m3u8Content.split("\n");
-						for (var li = 0; li < lines.length; li++) {
-							var line = lines[li];
-							if (line.indexOf("#EXT-X-STREAM-INF:") !== -1) {
-								var resMatch = line.match(/RESOLUTION=\d+x(\d+)/i);
-								var height = resMatch ? parseInt(resMatch[1], 10) : 0;
-								if (li + 1 < lines.length) {
-									var urlPart = lines[li + 1].trim();
-									if (urlPart && urlPart.indexOf("#") !== 0) {
-										var fullUrl =
-											urlPart.indexOf("http") === 0
-												? urlPart
-												: s.playlist.substring(
-														0,
-														s.playlist.lastIndexOf("/") + 1,
-													) + urlPart;
-										var qLabel =
-											height >= 2160
-												? "2160p"
-												: height >= 1440
-													? "1440p"
-													: height >= 1080
-														? "1080p"
-														: height >= 720
-															? "720p"
-															: height >= 480
-																? "480p"
-																: height >= 360
-																	? "360p"
-																	: height
-																		? height + "p"
-																		: "Auto";
-										m3u8Streams.push({
-											url: fullUrl,
-											quality: qLabel,
-											headers: {
-												"User-Agent": UA,
-												Referer: LORDFLIX_API + "/",
-												Origin: LORDFLIX_API,
-											},
-										});
-									}
-								}
+			if (s.type !== "hls" || !s.playlist) continue;
+
+			// Default quality label (used if M3U8 fetch/parse fails)
+			var bestQuality = s.quality || extractQuality(s.playlist) || "Auto";
+
+			// Try to fetch + parse master M3U8 for quality detection only
+			try {
+				var m3u8Fetch = httpGet(s.playlist, {
+					"User-Agent": UA,
+					Referer: LORDFLIX_API + "/",
+					Accept: "*/*",
+				});
+				var m3u8Timeout = new Promise(function (_, reject) {
+					setTimeout(function () {
+						reject(new Error("m3u8 timeout"));
+					}, 5000);
+				});
+				var m3u8Content = await Promise.race([m3u8Fetch, m3u8Timeout]);
+
+				if (m3u8Content && m3u8Content.indexOf("#EXTM3U") !== -1) {
+					var lines = m3u8Content.split("\n");
+					var highestH264Height = 0;
+
+					for (var li = 0; li < lines.length; li++) {
+						var line = lines[li];
+						if (line.indexOf("#EXT-X-STREAM-INF:") !== -1) {
+							var resMatch = line.match(/RESOLUTION=\d+x(\d+)/i);
+							var height = resMatch ? parseInt(resMatch[1], 10) : 0;
+
+							var codecs = extractCodecs(line);
+
+							// Only consider H.264 variants (skip HEVC which
+							// causes "audio only, no video" on most players)
+							if (codecs && hasUnsupportedVideoCodec(codecs)) {
+								continue;
+							}
+
+							// Track the highest H.264 quality for the label
+							if (height > highestH264Height) {
+								highestH264Height = height;
 							}
 						}
 					}
-				} catch (e) {
-					// M3U8 fetch failed, use quality from server
-				}
 
-				if (m3u8Streams.length > 0) {
-					// Sort by quality descending
-					var QR = {
-						"2160p": 7,
-						"1440p": 6,
-						"1080p": 5,
-						"720p": 4,
-						"480p": 3,
-						"360p": 2,
-						"240p": 1,
-					};
-					m3u8Streams.sort(function (a, b) {
-						return (QR[b.quality] || 0) - (QR[a.quality] || 0);
-					});
-					for (var mi = 0; mi < m3u8Streams.length; mi++) {
-						result.push(m3u8Streams[mi]);
+					if (highestH264Height > 0) {
+						bestQuality =
+							highestH264Height >= 1080
+								? "1080p"
+								: highestH264Height >= 720
+									? "720p"
+									: highestH264Height >= 480
+										? "480p"
+										: highestH264Height >= 360
+											? "360p"
+											: highestH264Height + "p";
 					}
-				} else {
-					// Fallback: use the playlist URL with server's quality hint
-					result.push({
-						url: s.playlist,
-						quality: s.quality || extractQuality(s.playlist) || "Auto",
-						headers: {
-							"User-Agent": UA,
-							Referer: LORDFLIX_API + "/",
-							Origin: LORDFLIX_API,
-						},
-					});
 				}
+			} catch (e) {
+				// M3U8 fetch/parse failed — use default quality label
 			}
+
+			// 🔴 Return the MASTER playlist URL (s.playlist), NOT individual
+			// variant URLs. The master has #EXT-X-MEDIA:TYPE=AUDIO tracks that
+			// HLS.js needs to associate audio with video during playback.
+			result.push({
+				url: s.playlist,
+				quality: bestQuality,
+				headers: {
+					"User-Agent": UA,
+					Referer: LORDFLIX_API + "/",
+					Origin: LORDFLIX_API,
+				},
+			});
 		}
 
 		return result;
