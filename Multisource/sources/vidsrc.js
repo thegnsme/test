@@ -155,8 +155,6 @@ var HARDCODED_DOMAINS = [
   "vidsrc-embed.ru",
   "vidsrc-embed.su",
   "vsrc.su",
-  "vsembed.ru",
-  "vsembed.su",
 ];
 function withTimeout(promise, ms, label) {
   return Promise.race([
@@ -176,13 +174,17 @@ async function fetchLiveDomains() {
       "domains fetch",
     );
     if (!html) return null;
+    var newSection = html.split("<h3>NEW DOMAINS:</h3>")[1];
+    if (!newSection) return null;
+    var endIdx = newSection.indexOf("<h3>OLD DOMAINS:");
+    var sectionHtml =
+      endIdx !== -1 ? newSection.substring(0, endIdx) : newSection;
     var domains = [];
     var regex = /https:\/\/([a-zA-Z0-9.-]+)/g;
     var m;
-    while ((m = regex.exec(html)) !== null) {
+    while ((m = regex.exec(sectionHtml)) !== null) {
       var d = m[1];
       if (
-        d.indexOf("vidsrc") !== -1 &&
         d !== "vidsrc.domains" &&
         d !== "vidsrc.community" &&
         domains.indexOf(d) === -1
@@ -249,7 +251,10 @@ function rc4Slug(data, keyStr) {
   var keyBytes = strToUtf8Bytes(keyStr);
   var dataBytes = strToUtf8Bytes(String(data));
   var enc = rc4Transform(keyBytes, dataBytes);
-  return b64encode(enc).replace(/[+=]/g, "");
+  return b64encode(enc)
+    .replace(/[+=]/g, "")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_");
 }
 function vrfDecrypt(vrfB64url) {
   try {
@@ -476,47 +481,48 @@ async function scrapeStreams(params) {
                 season,
                 episode,
               );
-              var html = null;
-              try {
-                html = await withTimeout(
-                  httpGet(eUrl, {
-                    "User-Agent": UA,
-                    Accept: "text/html,application/xhtml+xml",
-                    Referer: "https://" + d + "/",
-                  }),
-                  6e3,
-                  d + " embed",
-                );
-                if (
-                  !html ||
-                  (html.indexOf("DOCTYPE") === -1 &&
-                    html.indexOf("<html") === -1 &&
-                    html.indexOf("<iframe") === -1 &&
-                    html.indexOf("player_iframe") === -1)
-                ) {
-                  errors.push(d + ": invalid");
-                  return null;
-                }
-              } catch (e) {
-                errors.push(d + ": " + (e.message || "fail"));
-                return null;
-              }
               var m3u8 = null;
+              var html = null;
               try {
                 m3u8 = await withTimeout(
                   tryMediainfoApi(d, imdbId, tmdbId, type, season, episode),
-                  6e3,
+                  5e3,
                   d + " mi",
                 );
               } catch (e) {}
               if (!m3u8) {
                 try {
-                  m3u8 = await withTimeout(
-                    tryRcpExtraction(html, eUrl),
-                    5e3,
-                    d + " rcp",
+                  html = await withTimeout(
+                    httpGet(eUrl, {
+                      "User-Agent": UA,
+                      Accept: "text/html,application/xhtml+xml",
+                      Referer: "https://" + d + "/",
+                    }),
+                    10e3,
+                    d + " embed",
                   );
-                } catch (e) {}
+                } catch (e) {
+                  errors.push(d + ": " + (e.message || "fail"));
+                }
+                if (
+                  html &&
+                  (html.indexOf("DOCTYPE") !== -1 ||
+                    html.indexOf("<html") !== -1 ||
+                    html.indexOf("<iframe") !== -1 ||
+                    html.indexOf("player_iframe") !== -1)
+                ) {
+                  try {
+                    m3u8 = await withTimeout(
+                      tryRcpExtraction(html, eUrl),
+                      5e3,
+                      d + " rcp",
+                    );
+                  } catch (e) {}
+                } else if (html) {
+                  errors.push(d + ": invalid");
+                } else {
+                  errors.push(d + ": no response");
+                }
               }
               if (m3u8) {
                 foundM3u8 = m3u8;
@@ -592,8 +598,6 @@ async function scrapeStreams(params) {
     if (streams.length === 0) {
       for (var di = 0; di < domainsToTry.length; di++) {
         var domain = domainsToTry[di];
-        if (tried[domain]) continue;
-        tried[domain] = true;
         var eUrl = buildEmbedUrl(domain, type, imdbId, tmdbId, season, episode);
         try {
           var html = await withTimeout(
@@ -602,7 +606,7 @@ async function scrapeStreams(params) {
               Accept: "text/html,application/xhtml+xml",
               Referer: "https://" + domain + "/",
             }),
-            6e3,
+            10e3,
             domain + " embed",
           );
           if (
