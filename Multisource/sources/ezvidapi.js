@@ -15,7 +15,7 @@
  * Fetching it gives a proper HLS manifest with #EXT-X-STREAM-INF variants.
  */
 
-var { httpGet, httpPost, safeJsonParse } = require("./_shared");
+var { httpGet, httpPost, safeJsonParse, makeFail } = require("./_shared");
 
 var SOURCE_NAME = "ezvidapi";
 var API_BASE = "https://api.ezvidapi.com";
@@ -242,13 +242,7 @@ async function scrapeStreams(params) {
 	}
 
 	function fail(msg) {
-		return {
-			source: SOURCE_NAME,
-			status: "error",
-			error: msg || "unknown",
-			streams: [],
-			latency_ms: Date.now() - start,
-		};
+		return makeFail(SOURCE_NAME, msg, start);
 	}
 }
 

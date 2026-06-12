@@ -500,6 +500,31 @@ async function fetchM3U8AndParse(playlistUrl, reqHeaders, streamHeaders) {
 }
 
 // =========================================================================
+//  FAIL HELPER — standardized error response for all sources
+// =========================================================================
+
+/**
+ * Build a standardized error response for a source.
+ *
+ * Returns an error object with source name, error message, and elapsed time.
+ * All 8 sources previously had an identical copy of this function.
+ *
+ * @param {string} sourceName - SOURCE_NAME constant from the source file
+ * @param {string} msg - Error message
+ * @param {number} startTime - Date.now() captured at scrape start
+ * @returns {{ source: string, status: string, error: string, streams: Array, latency_ms: number }}
+ */
+function makeFail(sourceName, msg, startTime) {
+	return {
+		source: sourceName,
+		status: "error",
+		error: msg || "unknown",
+		streams: [],
+		latency_ms: Date.now() - (startTime || Date.now()),
+	};
+}
+
+// =========================================================================
 //  EXPORTS
 // =========================================================================
 
@@ -519,4 +544,5 @@ module.exports = {
 	extractSubtitlesFromM3U8: extractSubtitlesFromM3U8,
 	fetchM3U8AndParse: fetchM3U8AndParse,
 	copyHeaders: copyHeaders,
+	makeFail: makeFail,
 };

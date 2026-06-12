@@ -4,12 +4,17 @@
  * Returns the master playlist URL directly. Player handles variant selection.
  * Each stream object carries its own subtitles.
  */
-var { httpGet, fetchM3U8AndParse, copyHeaders } = require("./_shared");
+var {
+	httpGet,
+	fetchM3U8AndParse,
+	copyHeaders,
+	makeFail,
+} = require("./_shared");
 var SOURCE_NAME = "vidlink.pro";
 var ENC_API = "https://enc-dec.app/api/enc-vidlink";
 var VIDLINK_API = "https://vidlink.pro/api/b";
 var UA =
-	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36";
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36";
 
 async function scrapeStreams(params) {
 	var start = Date.now();
@@ -128,13 +133,7 @@ async function scrapeStreams(params) {
 	}
 
 	function fail(msg) {
-		return {
-			source: SOURCE_NAME,
-			status: "error",
-			error: msg || "unknown",
-			streams: [],
-			latency_ms: Date.now() - start,
-		};
+		return makeFail(SOURCE_NAME, msg, start);
 	}
 }
 

@@ -73,6 +73,7 @@ var {
 	extractSubtitlesFromM3U8,
 	resolveRelativeUrl,
 } = require("./_shared");
+var { makeFail } = require("./_shared");
 
 var SOURCE_NAME = "anyembed.xyz";
 var API_BASE = "https://api.anyembed.xyz";
@@ -651,13 +652,7 @@ async function scrapeStreams(params) {
 	}
 
 	function fail(msg) {
-		return {
-			source: SOURCE_NAME,
-			status: "error",
-			error: msg || "unknown",
-			streams: [],
-			latency_ms: Date.now() - start,
-		};
+		return makeFail(SOURCE_NAME, msg, start);
 	}
 }
 

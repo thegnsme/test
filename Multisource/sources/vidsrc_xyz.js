@@ -27,7 +27,7 @@
  * =============================================================================
  */
 
-var { httpGet } = require("./_shared");
+var { httpGet, makeFail } = require("./_shared");
 
 var SOURCE_NAME = "vidsrc.xyz";
 var DOMAINS_URL = "https://vidsrc.domains/";
@@ -566,13 +566,7 @@ async function scrapeStreams(params) {
 	}
 
 	function fail(msg) {
-		return {
-			source: SOURCE_NAME,
-			status: "error",
-			error: msg || "unknown",
-			streams: [],
-			latency_ms: Date.now() - start,
-		};
+		return makeFail(SOURCE_NAME, msg, start);
 	}
 }
 

@@ -10,7 +10,7 @@
  * Quality is auto-detected from the master playlist's highest RESOLUTION.
  */
 
-var { httpGet } = require("./_shared");
+var { httpGet, makeFail } = require("./_shared");
 
 var SOURCE_NAME = "vixsrc.to";
 var BASE_URL = "https://vixsrc.to";
@@ -293,13 +293,7 @@ async function scrapeStreams(params) {
 	}
 
 	function fail(msg) {
-		return {
-			source: SOURCE_NAME,
-			status: "error",
-			error: msg || "unknown",
-			streams: [],
-			latency_ms: Date.now() - start,
-		};
+		return makeFail(SOURCE_NAME, msg, start);
 	}
 }
 

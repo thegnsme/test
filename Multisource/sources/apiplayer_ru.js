@@ -23,7 +23,7 @@
  *   TV HLS: https://apiplayer.ru/hls-proxy/master/{imdbId}/{season}/{episode}
  */
 
-var { httpGet, extractJsValue } = require("./_shared");
+var { httpGet, extractJsValue, makeFail } = require("./_shared");
 
 var SOURCE_NAME = "apiplayer.ru";
 var BASE_URL = "https://apiplayer.ru";
@@ -219,13 +219,7 @@ async function scrapeStreams(params) {
 	}
 
 	function fail(msg) {
-		return {
-			source: SOURCE_NAME,
-			status: "error",
-			error: msg || "unknown",
-			streams: [],
-			latency_ms: Date.now() - start,
-		};
+		return makeFail(SOURCE_NAME, msg, start);
 	}
 }
 

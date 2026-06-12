@@ -22,7 +22,13 @@
  *   videasy.to directly in a browser first (to establish Cloudflare cookies).
  */
 
-var { httpGet, httpPost, safeJsonParse, fetchTmdbMeta } = require("./_shared");
+var {
+	httpGet,
+	httpPost,
+	safeJsonParse,
+	fetchTmdbMeta,
+	makeFail,
+} = require("./_shared");
 
 var SOURCE_NAME = "videasy.to";
 var VIDEO_API = "https://api.videasy.to/cdn/sources-with-title";
@@ -89,13 +95,7 @@ async function scrapeStreams(params) {
 	var start = Date.now();
 
 	function fail(msg) {
-		return {
-			source: SOURCE_NAME,
-			status: "error",
-			error: msg || "unknown",
-			streams: [],
-			latency_ms: Date.now() - start,
-		};
+		return makeFail(SOURCE_NAME, msg, start);
 	}
 
 	try {

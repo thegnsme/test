@@ -24,7 +24,7 @@
  *   • TMDB metadata integration for robust search
  */
 
-var { httpGet, httpPost, fetchTmdbMeta } = require("./_shared");
+var { httpGet, httpPost, fetchTmdbMeta, makeFail } = require("./_shared");
 
 var SOURCE_NAME = "lordflix";
 var LORDFLIX_API = "https://snowhouse.lordflix.club";
@@ -170,13 +170,7 @@ async function scrapeStreams(params) {
 	}
 
 	function fail(msg) {
-		return {
-			source: SOURCE_NAME,
-			status: "error",
-			error: msg || "unknown",
-			streams: [],
-			latency_ms: Date.now() - start,
-		};
+		return makeFail(SOURCE_NAME, msg, start);
 	}
 }
 

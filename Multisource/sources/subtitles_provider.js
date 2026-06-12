@@ -62,6 +62,13 @@
 
 var { httpGet, safeJsonParse, fetchTmdbMeta } = require("./_shared");
 
+// ── Subtitle result cache (bounded LRU) ──
+// Caches by (imdbId, type, season, episode) so repeated loadStreams calls
+// for the same content reuse subtitle results instead of re-fetching.
+var _subCache = {};
+var _subCacheKeys = [];
+var _subCacheMax = 100;
+
 // ═════════════════════════════════════════════════════════════════════════
 //  CONSTANTS
 // ═════════════════════════════════════════════════════════════════════════
@@ -700,6 +707,21 @@ async function fetchSubtitles(tmdbId, type, season, episode) {
 	var seasonNum = Math.max(1, parseInt(season, 10) || 1);
 	var episodeNum = Math.max(1, parseInt(episode, 10) || 1);
 
+	// Check cache first
+	var cacheKey =
+		String(tmdbIdNum) + ":" + contentType + ":S" + seasonNum + "E" + episodeNum;
+	if (_subCache[cacheKey] !== undefined) {
+		var cached = _subCache[cacheKey];
+		log(
+			"fetchSubtitles: cache HIT for " +
+				cacheKey +
+				" (" +
+				cached.length +
+				" subs)",
+		);
+		return cached;
+	}
+
 	log(
 		"fetchSubtitles(" +
 			contentType +
@@ -736,6 +758,14 @@ async function fetchSubtitles(tmdbId, type, season, episode) {
 				(Date.now() - start) +
 				"ms",
 		);
+
+		// Cache the result (including empty — no need to re-fetch)
+		_subCache[cacheKey] = subs;
+		_subCacheKeys.push(cacheKey);
+		while (_subCacheKeys.length > _subCacheMax) {
+			delete _subCache[_subCacheKeys.shift()];
+		}
+
 		return subs;
 	} catch (e) {
 		warn("fetchSubtitles error: " + (e && e.message));
