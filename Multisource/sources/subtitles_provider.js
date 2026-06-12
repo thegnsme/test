@@ -10,9 +10,31 @@
  *   This module is NOT a stream source. It enriches streams WITH subtitles.
  *   It is required()'d directly by plugin.js — not registered as a source.
  *
- *   Subtitles are attached using the format the player expects:
- *     { url: string, label: string, lang: string }
- *   where label is a human-readable language name like "English" or "English (SDH)".
+ *   🔴 CRITICAL: Subtitles MUST be assigned to stream objects AFTER the
+ *   StreamResult constructor, not inside it. The StreamResult constructor
+ *   may strip unknown fields including `subtitles`.
+ *     CORRECT:
+ *       var stream = new StreamResult({ url, source, headers, quality });
+ *       stream.subtitles = normalizeSubtitles(subtitles);
+ *     WRONG:
+ *       var stream = new StreamResult({ url, source, subtitles: subs });
+ *
+ *   🔴 CRITICAL: NEVER share the same subtitle array reference across
+ *   multiple streams. The player may mutate one stream's subtitles (e.g.,
+ *   when toggling on/off), which would corrupt all other streams. Always
+ *   deep-clone the subtitle array per stream.
+ *     CORRECT:
+ *       stream.subtitles = cloneSubtitles(subtitles);
+ *     WRONG:
+ *       stream.subtitles = subtitles;  // shared reference!
+ *
+ * SUBTITLE FORMAT:
+ *   Each subtitle object has BOTH `name` and `label` fields for maximum
+ *   player compatibility:
+ *     { url: string, name: string, label: string, lang: string }
+ *   - `name`  = used by some players (cinemacity, cinestream pattern)
+ *   - `label` = used by some players (netmirror pattern, DEVELOPER.md spec)
+ *   - `lang`  = ISO language code for player subtitle sync
  *
  * WHY SUBDL ONLY:
  *   SubSource (subsource.net) download URLs require API key headers that the
@@ -24,9 +46,10 @@
  *   in the QuickJS runtime).
  *
  * USAGE:
- *   var { fetchSubtitles } = require("./subtitles_provider");
+ *   var { fetchSubtitles, normalizeSubtitles, cloneSubtitles } = require("./subtitles_provider");
  *   var subs = await fetchSubtitles(550, "movie", 1, 1);
- *   // subs = [ { url: "...", label: "English", lang: "en" }, ... ]
+ *   // subs = [ { url: "...", name: "English", label: "English", lang: "en" }, ... ]
+ *   stream.subtitles = cloneSubtitles(subs);  // ← deep-cloned per stream
  * =============================================================================
  */
 
@@ -150,6 +173,97 @@ function warn() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════
+//  SUBTITLE NORMALIZATION — ensures maximum player compatibility
+// ═════════════════════════════════════════════════════════════════════════
+
+/**
+ * Normalize a single subtitle object to include BOTH `name` and `label` fields.
+ *
+ * Some players expect `{ url, name }` (cinemacity, cinestream pattern),
+ * others expect `{ url, label, lang }` (netmirror, DEVELOPER.md spec).
+ * This function ensures ALL fields are present for maximum compatibility.
+ *
+ * Input formats accepted:
+ *   { url, name }           → adds label=name, lang="en"
+ *   { url, label, lang }    → adds name=label
+ *   { url, label }          → adds name=label, lang="en"
+ *   { url, lang }           → adds name=languageName(lang), label=name
+ *   { url }                 → adds name="Subtitle", label="Subtitle", lang="en"
+ *
+ * @param {object} sub - Raw subtitle object
+ * @returns {object} Normalized subtitle { url, name, label, lang }
+ */
+function normalizeSubtitle(sub) {
+	if (!sub || !sub.url) return null;
+
+	var url = String(sub.url).trim();
+	if (!url) return null;
+
+	// Extract fields with fallbacks
+	var rawName = sub.name || sub.label || sub.lang || "";
+	var rawLabel = sub.label || sub.name || sub.lang || "";
+	var rawLang = sub.lang || "";
+
+	// Build name: prefer explicit name, then label, then language name from code
+	var name = "";
+	if (rawName) {
+		name = String(rawName).trim();
+	} else if (rawLang) {
+		name = languageName(rawLang);
+	} else {
+		name = "Subtitle";
+	}
+
+	// Build label: same logic, prefer explicit
+	var label = "";
+	if (rawLabel) {
+		label = String(rawLabel).trim();
+	} else if (rawLang) {
+		label = languageName(rawLang);
+	} else {
+		label = "Subtitle";
+	}
+
+	// Build lang: extract from existing or infer
+	var lang = rawLang ? String(rawLang).toLowerCase().trim() : "en";
+
+	return {
+		url: url,
+		name: name,
+		label: label,
+		lang: lang,
+	};
+}
+
+/**
+ * Deep-clone a subtitles array so each stream gets its own copy.
+ * PREVENTS the critical bug where a shared array reference causes
+ * subtitle corruption when the player toggles subtitles on one stream.
+ *
+ * @param {Array} subtitles - Array of subtitle objects
+ * @returns {Array} Deep-cloned, normalized subtitle array
+ */
+function cloneSubtitles(subtitles) {
+	if (!Array.isArray(subtitles)) return [];
+	if (subtitles.length === 0) return [];
+
+	var cloned = [];
+	for (var i = 0; i < subtitles.length; i++) {
+		var normalized = normalizeSubtitle(subtitles[i]);
+		if (normalized) {
+			// Create a truly independent copy
+			cloned.push({
+				url: normalized.url,
+				name: normalized.name,
+				label: normalized.label,
+				lang: normalized.lang,
+			});
+		}
+	}
+	return cloned;
+}
+
+// ═════════════════════════════════════════════════════════════════════════
 //  TMDB → IMDB MAPPING (cached)
 // ═════════════════════════════════════════════════════════════════════════
 
@@ -258,7 +372,7 @@ function normalizeSubdlLang(code) {
  * @param {string} type - "movie" or "tv"
  * @param {number} season
  * @param {number} episode
- * @returns {Promise<Array<{url, label, lang}>>}
+ * @returns {Promise<Array<{url, name, label, lang}>>}
  */
 async function fetchSubdlSubtitles(imdbId, type, season, episode) {
 	try {
@@ -321,10 +435,10 @@ async function fetchSubdlSubtitles(imdbId, type, season, episode) {
 							url: fileUrl,
 							label: label,
 							lang: lang,
+							name: label,
 							hi: isHi,
 							format: uf.format || "srt",
 							score: isHi ? 10 : 5,
-							// We prefer higher score: SDH > non-SDH, larger files > smaller
 							size: uf.size || 0,
 							rank: isHi ? 2 : 1,
 						});
@@ -334,7 +448,6 @@ async function fetchSubdlSubtitles(imdbId, type, season, episode) {
 		}
 
 		// Deduplicate by language: keep the best subtitle per language
-		// Best = SDH preferred, then larger file size
 		var bestPerLanguage = {};
 		for (var ri = 0; ri < allResults.length; ri++) {
 			var item = allResults[ri];
@@ -342,7 +455,6 @@ async function fetchSubdlSubtitles(imdbId, type, season, episode) {
 			if (!existing) {
 				bestPerLanguage[item.lang] = item;
 			} else {
-				// Prefer: higher rank (SDH > non-SDH), then larger size
 				if (
 					item.rank > existing.rank ||
 					(item.rank === existing.rank && item.size > existing.size)
@@ -352,16 +464,15 @@ async function fetchSubdlSubtitles(imdbId, type, season, episode) {
 			}
 		}
 
-		// Convert to clean output format
+		// Convert to normalized output format (name + label + lang)
 		var results = [];
 		for (var langCode in bestPerLanguage) {
 			if (bestPerLanguage.hasOwnProperty(langCode)) {
 				var best = bestPerLanguage[langCode];
-				results.push({
-					url: best.url,
-					label: best.label,
-					lang: best.lang,
-				});
+				var normalized = normalizeSubtitle(best);
+				if (normalized) {
+					results.push(normalized);
+				}
 			}
 		}
 
@@ -381,20 +492,99 @@ async function fetchSubdlSubtitles(imdbId, type, season, episode) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════
-//  PUBLIC API
+//  ATTACH SUBTITLES TO STREAMS — FIXED version
+// ═════════════════════════════════════════════════════════════════════════
+//
+//  🔴 FIX: Deep-clone subtitles for EACH stream to prevent shared-reference
+//  corruption when the player toggles subtitles on/off per stream.
+//
+//  🔴 FIX: Normalize all subtitle objects to include both `name` and `label`
+//  fields for maximum player compatibility.
+// ═════════════════════════════════════════════════════════════════════════
+
+/**
+ * Enrich an array of stream objects with subtitles.
+ * EACH stream gets its OWN deep-cloned copy of the subtitle array.
+ *
+ * @param {Array} streams - Array of stream objects (plain objects, NOT StreamResult)
+ * @param {Array} subtitles - Array of {url, name, label, lang}
+ * @returns {Array} The same streams array (mutated in-place)
+ */
+function attachSubtitlesToStreams(streams, subtitles) {
+	if (!streams || !Array.isArray(streams)) return streams;
+	if (!subtitles || !Array.isArray(subtitles) || subtitles.length === 0) {
+		return streams;
+	}
+
+	log(
+		"attachSubtitlesToStreams: enriching " +
+			streams.length +
+			" stream(s) with " +
+			subtitles.length +
+			" subtitle(s)",
+	);
+
+	for (var i = 0; i < streams.length; i++) {
+		var s = streams[i];
+		if (!s) continue;
+
+		// Normalize then deep-clone the external subtitles (never share reference)
+		var externalSubs = cloneSubtitles(subtitles);
+
+		// Check if stream already has subtitles from its source
+		var existing = s.subtitles;
+		if (existing && Array.isArray(existing) && existing.length > 0) {
+			// Normalize existing subtitles too
+			var normalizedExisting = [];
+			for (var ei = 0; ei < existing.length; ei++) {
+				var norm = normalizeSubtitle(existing[ei]);
+				if (norm) normalizedExisting.push(norm);
+			}
+
+			// Deduplicate by URL: keep existing, add new ones not already present
+			var existingUrls = {};
+			for (var ei2 = 0; ei2 < normalizedExisting.length; ei2++) {
+				if (normalizedExisting[ei2] && normalizedExisting[ei2].url) {
+					existingUrls[normalizedExisting[ei2].url] = true;
+				}
+			}
+
+			var merged = normalizedExisting.slice();
+			for (var si = 0; si < externalSubs.length; si++) {
+				if (
+					externalSubs[si] &&
+					externalSubs[si].url &&
+					!existingUrls[externalSubs[si].url]
+				) {
+					merged.push(externalSubs[si]);
+				}
+			}
+			s.subtitles = merged;
+		} else {
+			// No existing subtitles — attach deep-cloned copy
+			s.subtitles = externalSubs;
+		}
+	}
+
+	return streams;
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+//  PUBLIC API — fetchSubtitles
 // ═════════════════════════════════════════════════════════════════════════
 
 /**
  * Fetch subtitles from SubDL for a given piece of content.
  *
  * Uses TMDB → IMDB mapping to ensure accurate subtitle matching.
- * Results are deduplicated by language (best subtitle per language).
+ * Results are normalized (name + label + lang fields) and deduplicated
+ * by language (best subtitle per language).
  *
  * @param {number} tmdbId - TMDB content ID
  * @param {string} type - "movie" or "tv"
  * @param {number} [season=1]
  * @param {number} [episode=1]
- * @returns {Promise<Array<{url: string, label: string, lang: string}>>}
+ * @returns {Promise<Array<{url: string, name: string, label: string, lang: string}>>}
  */
 async function fetchSubtitles(tmdbId, type, season, episode) {
 	var start = Date.now();
@@ -446,55 +636,14 @@ async function fetchSubtitles(tmdbId, type, season, episode) {
 	}
 }
 
-/**
- * Enrich an array of stream objects with subtitles.
- * Adds subtitles to streams that lack them.
- *
- * @param {Array} streams - Array of stream objects
- * @param {Array} subtitles - Array of {url, label, lang}
- * @returns {Array} Streams with subtitles attached
- */
-function attachSubtitlesToStreams(streams, subtitles) {
-	if (!streams || !Array.isArray(streams)) return streams;
-	if (!subtitles || !Array.isArray(subtitles) || subtitles.length === 0) {
-		return streams;
-	}
-
-	for (var i = 0; i < streams.length; i++) {
-		var s = streams[i];
-		if (!s) continue;
-
-		// If stream already has subtitles, append new ones (dedup by URL)
-		var existing = s.subtitles;
-		if (existing && existing.length > 0) {
-			var existingUrls = {};
-			for (var ei = 0; ei < existing.length; ei++) {
-				if (existing[ei] && existing[ei].url)
-					existingUrls[existing[ei].url] = true;
-			}
-			var toAdd = [];
-			for (var si = 0; si < subtitles.length; si++) {
-				if (
-					subtitles[si] &&
-					subtitles[si].url &&
-					!existingUrls[subtitles[si].url]
-				) {
-					toAdd.push(subtitles[si]);
-				}
-			}
-			if (toAdd.length > 0) {
-				s.subtitles = existing.concat(toAdd);
-			}
-		} else {
-			// Stream has no subtitles — attach all
-			s.subtitles = subtitles;
-		}
-	}
-	return streams;
-}
+// ═════════════════════════════════════════════════════════════════════════
+//  EXPORTS
+// ═════════════════════════════════════════════════════════════════════════
 
 module.exports = {
 	fetchSubtitles: fetchSubtitles,
 	attachSubtitlesToStreams: attachSubtitlesToStreams,
+	normalizeSubtitle: normalizeSubtitle,
+	cloneSubtitles: cloneSubtitles,
 	tmdbToImdb: tmdbToImdb,
 };

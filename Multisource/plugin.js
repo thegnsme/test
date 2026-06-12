@@ -18,6 +18,19 @@
  *    • Quality auto-detection from URL when source omits it
  *    • Streams sorted: highest quality first, then alphabetically by source
  *
+ *  🔴 SUBTITLE ARCHITECTURE (CRITICAL):
+ *    Subtitles MUST be assigned to StreamResult objects AFTER construction,
+ *    NOT as part of the constructor. The StreamResult constructor may strip
+ *    unknown fields including `subtitles`. All reference plugins (netmirror,
+ *    cinestream, cinemacity) follow this pattern:
+ *
+ *      var sr = new StreamResult({ url, source, headers, quality });
+ *      sr.subtitles = mergedSubtitles;  // ← AFTER constructor
+ *
+ *    Each stream receives its OWN deep-cloned subtitle array — never share
+ *    a single array reference across streams. Player subtitle toggling on
+ *    one stream must not corrupt others.
+ *
  *  URL SCHEME:
  *    Movie:  nuvio://movie/{tmdbId}
  *    TV:     nuvio://tv/{tmdbId}/{season}/{episode}
@@ -274,13 +287,13 @@
 	);
 
 	// ═════════════════════════════════════════════════════════════════════════
-	//  SUBTITLE PROVIDER — SubDL + SubSource enrichment
+	//  SUBTITLE PROVIDER — SubDL enrichment
 	// ═════════════════════════════════════════════════════════════════════════
 
 	var SUBTITLE_PROVIDER;
 	try {
 		SUBTITLE_PROVIDER = require("./sources/subtitles_provider");
-		log("Subtitle provider loaded: SubDL + SubSource");
+		log("Subtitle provider loaded: SubDL");
 	} catch (e) {
 		warn("require('./sources/subtitles_provider') failed — subtitles disabled");
 		SUBTITLE_PROVIDER = {
@@ -289,6 +302,19 @@
 			},
 			attachSubtitlesToStreams: function (s, subs) {
 				return s;
+			},
+			cloneSubtitles: function (arr) {
+				return arr ? JSON.parse(JSON.stringify(arr)) : [];
+			},
+			normalizeSubtitle: function (sub) {
+				return sub
+					? {
+							url: sub.url,
+							name: sub.label || sub.name || "Subtitle",
+							label: sub.label || sub.name || "Subtitle",
+							lang: sub.lang || "en",
+						}
+					: null;
 			},
 		};
 	}
@@ -761,6 +787,29 @@
 		return 3;
 	}
 
+	/**
+	 * ====================================================================
+	 *  loadStreams — FIXED subtitle architecture
+	 * ====================================================================
+	 *
+	 *  🔴 CRITICAL BUGS FIXED:
+	 *
+	 *  1. StreamResult constructor strips subtitles
+	 *     BEFORE: new StreamResult({..., subtitles: [...]}) — subtitles lost
+	 *     AFTER:  var sr = new StreamResult({url, source, ...});
+	 *             sr.subtitles = mergedSubs;  // assigned after construction
+	 *
+	 *  2. Shared subtitle array reference across streams
+	 *     BEFORE: s.subtitles = subtitles (same reference for all streams)
+	 *             → toggling subtitles on one stream corrupts all others
+	 *     AFTER:  Each stream gets its own deep-cloned copy via cloneSubtitles()
+	 *
+	 *  3. Subtitle format normalization
+	 *     BEFORE: Only `label` and `lang` fields
+	 *     AFTER:  Both `name` and `label` fields for max player compatibility
+	 *             (cinemacity/cinestream use `name`, netmirror uses `label`)
+	 * ====================================================================
+	 */
 	async function loadStreams(url, cb) {
 		log("loadStreams(" + url + ")");
 		var parsed = parseRef(url);
@@ -811,6 +860,9 @@
 
 			var seenUrls = {};
 			var all = [];
+			// 🔴 FIX: Store source-provided subtitles separately from streamObj
+			// so they are NOT passed through the StreamResult constructor.
+			var sourceSubsList = [];
 
 			for (var i = 0; i < aggregated.sources.length; i++) {
 				var src = aggregated.sources[i];
@@ -822,9 +874,6 @@
 
 					var q = s.quality || extractQualityFromUrl(s.url);
 					var baseSource = src.source || s.source;
-					// Append quality to source label for multi-quality differentiation
-					// "ezvidapi" + "1080p" -> "ezvidapi [1080p]"
-					// "lordflix" + "Auto"  -> "lordflix" (single master, ABR handled internally)
 					var displayLabel = baseSource;
 					if (q && q !== "Auto" && q !== "auto") {
 						displayLabel = baseSource + " [" + q + "]";
@@ -842,19 +891,19 @@
 						}
 						if (hk > 0) streamObj.headers = s.headers;
 					}
-					if (s.subtitles && s.subtitles.length > 0) {
-						streamObj.subtitles = s.subtitles;
-					}
+					// 🔴 FIX: Do NOT put subtitles in streamObj — store separately
+					var streamSourceSubs =
+						s.subtitles && s.subtitles.length > 0 ? s.subtitles.slice() : null;
 					streamObj._qr = qualityRank(streamObj.quality || q);
 					all.push(streamObj);
+					sourceSubsList.push(streamSourceSubs);
 				}
 			}
 
 			// ═══ SUBTITLE ENRICHMENT ═══════════════════════════════════════
-			// Fetch subtitles from SubDL + SubSource using TMDB → IMDB mapping.
-			// This ensures accurate subtitle matching for movies, TV, and anime.
-			// Enrichment is done in parallel with a short timeout so stream
-			// aggregation is never blocked.
+			// Non-blocking: subtitles are best-effort enrichment.
+			// Streams are returned with or without subtitles.
+			var externalSubs = [];
 			try {
 				var subsPromise = SUBTITLE_PROVIDER.fetchSubtitles(
 					params.tmdbId,
@@ -867,27 +916,21 @@
 						reject(new Error("subtitle fetch timeout"));
 					}, 15000);
 				});
-				var externalSubs = await Promise.race([subsPromise, subsTimeout]).catch(
+				externalSubs = await Promise.race([subsPromise, subsTimeout]).catch(
 					function () {
 						return [];
 					},
 				);
 				if (externalSubs && externalSubs.length > 0) {
 					log(
-						"  → enriching " +
-							all.length +
-							" stream(s) with " +
+						"  → fetched " +
 							externalSubs.length +
-							" subtitle(s)",
+							" external subtitle language(s)",
 					);
-					SUBTITLE_PROVIDER.attachSubtitlesToStreams(all, externalSubs);
 				}
 			} catch (subsErr) {
-				// Non-blocking: subtitles are a best-effort enrichment
 				log(
-					"  → subtitle enrichment skipped (" +
-						(subsErr && subsErr.message) +
-						")",
+					"  → subtitle fetch skipped (" + (subsErr && subsErr.message) + ")",
 				);
 			}
 			// ═══ END SUBTITLE ENRICHMENT ═══════════════════════════════════
@@ -898,11 +941,81 @@
 				return (a.source || "").localeCompare(b.source || "");
 			});
 
-			// Convert to StreamResult objects and remove internal key
+			// ── Build StreamResult objects ──
+			// 🔴 FIX: Create StreamResult WITHOUT subtitles, then assign AFTER.
 			var streamResults = [];
 			for (var si = 0; si < all.length; si++) {
-				delete all[si]._qr;
-				streamResults.push(new StreamResult(all[si]));
+				var obj = all[si];
+				delete obj._qr;
+
+				// Step 1: Create StreamResult WITHOUT subtitles
+				var sr = new StreamResult(obj);
+
+				// Step 2: Build merged subtitle list (deep-cloned per-stream)
+				var mergedSubs = [];
+
+				// 2a: Add source-provided subtitles (deep-cloned)
+				var srcSubs = sourceSubsList[si];
+				if (srcSubs && srcSubs.length > 0) {
+					var cloneFn =
+						SUBTITLE_PROVIDER.cloneSubtitles ||
+						function (arr) {
+							return arr
+								? arr
+										.map(function (x) {
+											return x
+												? {
+														url: x.url,
+														name: x.name || x.label || x.lang || "Subtitle",
+														label: x.label || x.name || x.lang || "Subtitle",
+														lang: x.lang || "en",
+													}
+												: null;
+										})
+										.filter(Boolean)
+								: [];
+						};
+					mergedSubs = cloneFn(srcSubs);
+				}
+
+				// 2b: Add external subtitles (dedup by URL, normalize format)
+				if (externalSubs && externalSubs.length > 0) {
+					var existingUrls = {};
+					for (var ei = 0; ei < mergedSubs.length; ei++) {
+						if (mergedSubs[ei] && mergedSubs[ei].url) {
+							existingUrls[mergedSubs[ei].url] = true;
+						}
+					}
+					for (var ei2 = 0; ei2 < externalSubs.length; ei2++) {
+						var ext = externalSubs[ei2];
+						if (!ext || !ext.url) continue;
+						// Skip if this subtitle URL is already in the list
+						if (existingUrls[ext.url]) continue;
+						existingUrls[ext.url] = true;
+
+						// Normalize to include both `name` and `label`
+						var norm =
+							SUBTITLE_PROVIDER.normalizeSubtitle &&
+							SUBTITLE_PROVIDER.normalizeSubtitle(ext);
+						if (!norm) {
+							norm = {
+								url: ext.url,
+								name: ext.label || ext.name || ext.lang || "Subtitle",
+								label: ext.label || ext.name || ext.lang || "Subtitle",
+								lang: ext.lang || "en",
+							};
+						}
+						mergedSubs.push(norm);
+					}
+				}
+
+				// Step 3: 🔴 Assign subtitles AFTER StreamResult construction
+				// This is the critical fix — all reference plugins do this.
+				if (mergedSubs.length > 0) {
+					sr.subtitles = mergedSubs;
+				}
+
+				streamResults.push(sr);
 			}
 
 			log(
@@ -914,7 +1027,10 @@
 					aggregated.totalSources +
 					" sources (" +
 					aggregated.elapsed_ms +
-					"ms) with subtitles",
+					"ms)" +
+					(externalSubs && externalSubs.length > 0
+						? " with " + externalSubs.length + " subtitle language(s)"
+						: ""),
 			);
 			cb({ success: true, data: streamResults });
 		} catch (e) {

@@ -1,7 +1,7 @@
 /**
  * =============================================================================
  *  SHARED HELPERS for MultiSource plugin sources (Production)
- *  =============================================================================
+ * =============================================================================
  *
  *  Provides HTTP wrappers with retry, response caching, TMDB metadata helper,
  *  and quality detection utilities. Designed for both SkyStream QuickJS runtime
@@ -11,6 +11,7 @@
  *    • httpGet/httpPost with configurable retry + exponential backoff
  *    • Simple response cache to avoid re-fetching in same session
  *    • fetchTmdbMeta with caching (reduces TMDB API calls)
+ *          — Uses rotating TMDB API keys (same set as plugin.js) to avoid rate limits
  *    • Safe JSON parsing with fallback
  *    • URL quality detection helper (shared across sources)
  *    • M3U8 parsing helper (shared across sources that scrape HLS)
@@ -23,7 +24,17 @@
  * =============================================================================
  */
 
-var TMDB_KEY = "68e094699525b18a70bab2f86b1fa706";
+// ═══ Rotating TMDB API keys (same set as plugin.js for load balancing) ═══
+var TMDB_KEYS = [
+	"68e094699525b18a70bab2f86b1fa706",
+	"af3a53eb387d57fc935e9128468b1899",
+	"0142a22c560ce3efb1cfd6f3b2faab77",
+];
+var _tmdbIdx = 0;
+function tmdbKey() {
+	return TMDB_KEYS[_tmdbIdx++ % TMDB_KEYS.length];
+}
+
 var TMDB_BASE = "https://api.themoviedb.org/3";
 
 // ── Response cache (bounded LRU, per-session) ──
@@ -154,12 +165,13 @@ function sleep(ms) {
 }
 
 // =========================================================================
-//  TMDB METADATA FETCHER (with caching)
+//  TMDB METADATA FETCHER (with caching + rotating keys)
 // =========================================================================
 
 /**
  * Fetch metadata from TMDB needed by some sources (title, year, imdb_id).
  * Results are cached in-memory to avoid redundant API calls.
+ * Uses rotating API keys to distribute rate-limit load.
  *
  * @param {number|string} tmdbId - TMDB ID
  * @param {string} type - 'movie' or 'tv'
@@ -176,7 +188,7 @@ async function fetchTmdbMeta(tmdbId, type) {
 			endpoint +
 			String(tmdbId) +
 			"?api_key=" +
-			TMDB_KEY +
+			tmdbKey() +
 			"&append_to_response=external_ids";
 		var resp = await httpGet(url, {
 			"User-Agent": DEFAULT_UA,
@@ -460,7 +472,7 @@ function qualityRank(q) {
 	if (qs.indexOf("480") !== -1) return 3;
 	if (qs.indexOf("360") !== -1) return 2;
 	if (qs.indexOf("240") !== -1) return 1;
-	return 3; // default to 480p equivalent
+	return 3;
 }
 
 // =========================================================================
