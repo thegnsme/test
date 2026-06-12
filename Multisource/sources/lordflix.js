@@ -286,15 +286,13 @@ async function queryServer(
 
 		// ── Step 5 + 6: Extract streams with codec filtering ──
 		//
-		// 🔴 CRITICAL: We MUST return the MASTER playlist URL (s.playlist), NOT
-		// individual variant URLs (video_1080p.m3u8 etc). The master playlist
-		// contains #EXT-X-MEDIA:TYPE=AUDIO references that tell HLS.js to fetch
-		// separate audio playlists. Individual variant playlists are VIDEO ONLY
-		// — returning them causes "video but no audio" playback.
+		// RETURNS the MASTER PLAYLIST URL (s.playlist), NOT individual variant
+		// URLs. The master playlist contains #EXT-X-MEDIA:TYPE=AUDIO references
+		// that tell HLS.js to fetch separate audio playlists.
 		//
-		// The M3U8 parsing is only used for QUALITY DETECTION (finding the best
-		// H.264 quality to display in the UI label). The actual stream URL is
-		// always the master playlist.
+		// The M3U8 parsing is used for QUALITY DETECTION (finding the best
+		// H.264 quality to display in the UI label) AND for extracting
+		// audio track URLs when the master has separate audio streams.
 		var result = [];
 		for (var i = 0; i < streamList.length; i++) {
 			var s = streamList[i];
@@ -303,7 +301,8 @@ async function queryServer(
 			// Default quality label (used if M3U8 fetch/parse fails)
 			var bestQuality = s.quality || extractQuality(s.playlist) || "Auto";
 
-			// Try to fetch + parse master M3U8 for quality detection only
+			// Try to fetch + parse master M3U8 for quality detection + audio
+			var audioTrack = null;
 			try {
 				var m3u8Fetch = httpGet(s.playlist, {
 					"User-Agent": UA,
@@ -340,6 +339,32 @@ async function queryServer(
 								highestH264Height = height;
 							}
 						}
+
+						// Extract audio track URL from master playlist
+						if (line.indexOf("#EXT-X-MEDIA:TYPE=AUDIO") !== -1) {
+							var auUrlMatch = line.match(/URI="([^"]+)"/);
+							var auLangMatch = line.match(/LANGUAGE="([^"]+)"/);
+							var auNameMatch = line.match(/NAME="([^"]+)"/);
+							if (auUrlMatch && auUrlMatch[1] && !audioTrack) {
+								var audioUrl = auUrlMatch[1];
+								if (audioUrl.indexOf("http") !== 0) {
+									// Resolve relative URL against the playlist URL
+									var originM = s.playlist.match(/^(https?:\/\/[^/]+)/);
+									if (audioUrl.indexOf("/") === 0 && originM) {
+										audioUrl = originM[1] + audioUrl;
+									} else if (audioUrl.indexOf("//") === 0) {
+										audioUrl = "https:" + audioUrl;
+									} else {
+										audioUrl = s.playlist.replace(/\/[^/]*$/, "/") + audioUrl;
+									}
+								}
+								audioTrack = {
+									url: audioUrl,
+									label: (auNameMatch && auNameMatch[1]) || "Audio",
+									lang: (auLangMatch && auLangMatch[1]) || "en",
+								};
+							}
+						}
 					}
 
 					if (highestH264Height > 0) {
@@ -359,17 +384,21 @@ async function queryServer(
 				// M3U8 fetch/parse failed — use default quality label
 			}
 
-			// 🔴 Return the MASTER playlist URL (s.playlist), NOT individual
-			// variant URLs. The master has #EXT-X-MEDIA:TYPE=AUDIO tracks that
-			// HLS.js needs to associate audio with video during playback.
+			// Return the MASTER playlist URL (s.playlist). The master has
+			// #EXT-X-MEDIA:TYPE=AUDIO tracks that HLS.js uses for audio.
+			var streamHeaders = {
+				"User-Agent": UA,
+				Referer: LORDFLIX_API + "/",
+				Origin: LORDFLIX_API,
+				Accept: "*/*",
+			};
+
 			result.push({
 				url: s.playlist,
 				quality: bestQuality,
-				headers: {
-					"User-Agent": UA,
-					Referer: LORDFLIX_API + "/",
-					Origin: LORDFLIX_API,
-				},
+				headers: streamHeaders,
+				// Attach extracted audio track for player reference
+				audio: audioTrack ? [audioTrack] : undefined,
 			});
 		}
 

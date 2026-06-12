@@ -484,15 +484,8 @@ async function scrapeStreams(params) {
 				// Check for Turnstile
 				if (hasTurnstile(embedHtml)) {
 					turnstileBlocked.push(domain);
-					// Still add as embed fallback
-					streams.push({
-						url: embedUrl,
-						quality: "embed-" + domain,
-						headers: {
-							"User-Agent": UA,
-							Referer: "https://" + domain + "/",
-						},
-					});
+					// Skip — embed URLs can't be played by the player.
+					// Try next domain in case it doesn't have Turnstile.
 					continue;
 				}
 
@@ -524,15 +517,7 @@ async function scrapeStreams(params) {
 					}
 				}
 
-				// Strategy 3: Return embed URL as fallback
-				streams.push({
-					url: embedUrl,
-					quality: "embed-" + domain,
-					headers: {
-						"User-Agent": UA,
-						Referer: "https://" + domain + "/",
-					},
-				});
+				// No extraction method worked for this domain
 			} catch (e) {
 				// Domain failed, try next one
 				continue;
@@ -540,10 +525,14 @@ async function scrapeStreams(params) {
 		}
 
 		if (streams.length === 0) {
+			var errMsg =
+				turnstileBlocked.length === domains.length
+					? "all domains blocked by Turnstile — cannot extract M3U8"
+					: "all domains failed (" + tried.join(", ") + ")";
 			return {
 				source: SOURCE_NAME,
 				status: "no_streams",
-				error: "all domains failed (" + tried.join(", ") + ")",
+				error: errMsg,
 				streams: [],
 				latency_ms: Date.now() - start,
 			};
@@ -554,12 +543,6 @@ async function scrapeStreams(params) {
 			status: "working",
 			streams: streams,
 			latency_ms: Date.now() - start,
-			note:
-				turnstileBlocked.length > 0
-					? "domains behind Turnstile: " +
-						turnstileBlocked.join(", ") +
-						". Embed URLs returned as fallback."
-					: undefined,
 		};
 	} catch (e) {
 		return fail(e.message);

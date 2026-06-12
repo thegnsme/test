@@ -211,7 +211,30 @@ async function scrapeStreams(params) {
 			});
 		}
 
-		// Sort by quality descending
+		// ── Also add embed URL as fallback (works in WebView/iframe) ──
+		// The CDN (server.digitalsun.app) uses Cloudflare JS challenge which
+		// blocks direct stream access. The embed page in a WebView can handle
+		// Cloudflare in the browser context.
+		var embedUrl =
+			"https://videasy.to/embed/" +
+			(params.type === "tv" ? "tv" : "movie") +
+			"/" +
+			params.tmdbId;
+		if (params.type === "tv") {
+			embedUrl += "/" + (params.season || 1) + "/" + (params.episode || 1);
+		}
+		// Add embed as the FIRST option (highest priority for WebView players)
+		streams.unshift({
+			url: embedUrl,
+			quality: "Auto",
+			headers: {
+				"User-Agent": UA,
+				Referer: "https://videasy.to/",
+			},
+			subtitles: subs.length > 0 ? subs : undefined,
+		});
+
+		// Sort by quality descending (keep embed Auto at top)
 		streams.sort(function (a, b) {
 			return qualityRank(b.quality) - qualityRank(a.quality);
 		});
