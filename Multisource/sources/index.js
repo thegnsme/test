@@ -33,7 +33,7 @@ var SOURCES_REGISTRY = {
 	lordflix: require("./lordflix"),
 	ezvidapi: require("./ezvidapi"),
 	"apiplayer.ru": require("./apiplayer_ru"),
-	// ═══ anyembed.xyz — API-based multi-quality HLS with subtitles ════
+	"mapple.uk": require("./mapple_uk"),
 	"anyembed.xyz": require("./anyembed_xyz"),
 	// ═════════════════════════════════════════════════════════════════════
 	// ═══ REMOVED: broken sources ═══════════════════════════════════════
@@ -41,8 +41,6 @@ var SOURCES_REGISTRY = {
 	// superembed.stream — same backend as multiembed.mov, both blocked
 	// multiembed.mov    — directstream.php returns empty, page blocked
 	// embedmaster.com   — embeds require Cloudflare Turnstile, can't play directly
-	// mappletv.uk       — API returns valid M3U8 but all variants serve a
-	//                     7-second tutorial/promo video, not real content
 	// vixsrc.to        — ECONNRESET (Cloudflare actively blocks all connections)
 	// vidsrc.xyz       — all .ru/.su domains behind Cloudflare Turnstile;
 	//                    works ~30% from CLI but URLs expire before playback
