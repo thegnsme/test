@@ -38,14 +38,15 @@ var SOURCES_REGISTRY = {
 	// ═══ anyembed.xyz — API-based multi-quality HLS with subtitles ════
 	"anyembed.xyz": require("./anyembed_xyz"),
 	// ═════════════════════════════════════════════════════════════════════
-	// ═══ REMOVED: broken sources ══════════════════════════════════
+	// ═══ REMOVED: broken sources ═══════════════════════════════════════
 	// 2embed.cc      — site blocks requests ("embed page empty")
 	// superembed.stream — same backend as multiembed.mov, both blocked
 	// multiembed.mov    — directstream.php returns empty, page blocked
 	// embedmaster.com   — embeds require Cloudflare Turnstile, can't play directly
 	// mappletv.uk       — API returns valid M3U8 but all variants serve a
 	//                     7-second tutorial/promo video, not real content
-	// ═══════════════════════════════════════════════════════════════
+	// ═══════════════════════════════════════════════════════════════════
+	// ── Add new sources above this line ──
 };
 
 // =========================================================================
@@ -59,8 +60,8 @@ var HEALTH_RESET_AFTER = 300000; // 5 min cooldown for unhealthy sources
 
 // Per-source timeout overrides (for known slow sources)
 var SOURCE_TIMEOUT_OVERRIDES = {
-	lordflix: 45000, // 10 parallel servers, each makes 4 requests → generous but capped
-	"mappletv.uk": 25000, // VidFast multi-step chain
+	lordflix: 45000, // 10 parallel servers, each makes 4 requests
+	"anyembed.xyz": 30000, // API auth + provider fallback chain
 	ezvidapi: 20000, // API-based multi-provider with M3U8 fetch
 };
 
