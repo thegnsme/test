@@ -1,30 +1,25 @@
 /**
  * videasy.to — HLS via encrypted API (Production)
  *
- * Decrypts via enc-dec.app, returns quality variants (1080p/720p/480p).
- * Each stream carries its own deep-cloned subtitles with proper labels.
+ * Decrypts via enc-dec.app, returns quality variants (1080p/720p/480p)
+ * with subtitles. Handles unreliable API with retry logic.
  *
  * FIXED:
  *   • TMDB metadata integration — gets IMDB ID, title, year for API
- *   • Proper API URL construction with all available parameters
- *   • Subtitle deep-cloning per stream (no shared array references)
- *   • Origin header added for CDN access
- *   • Cleaner error handling
- *
- * FLOW:
- *   1. Fetch TMDB metadata (title, year, imdb_id)
- *   2. POST encrypted payload from videasy API (with TMDB metadata)
- *   3. Decrypt via enc-dec.app
- *   4. Parse response: sources[] with per-variant quality + subtitles[]
- *   5. Deep-clone subtitles per stream to avoid shared references
- *   6. Return streams quality-sorted descending
+ *   • JSON API format for decryption (api changed from form-encoded q=)
+ *   • Retry logic for unreliable API (500/timeout ~20%)
+ *   • Proper subtitle labeling (uses language field, not "VTT")
+ *   • CDN Cloudflare limitation documented in response
  *
  * ⚠ CDN LIMITATION (server.digitalsun.app):
- *   • Cloudflare JS challenge — blocks ALL non-browser requests (Node.js, curl)
- *   • Even real browsers get challenged unless they have active cf_clearance
- *   • The API (api.videasy.to) works, but the CDN (server.digitalsun.app) blocks
- *   • This is a FUNDAMENTAL source limitation, not a scraper bug
- *   • Consider using a different source if videasy.to streams fail to play
+ *   This source's CDN uses strict Cloudflare JS challenge. ALL requests
+ *   from non-browser contexts (Node.js, curl) get 403. Even real browsers
+ *   may get challenged without cf_clearance cookies. The API works, the
+ *   scraper returns valid stream URLs, but PLAYBACK DEPENDS ON THE
+ *   PLAYER'S BROWSER HAVING CLOUDFLARE CLEARANCE for digitalsun.app.
+ *
+ *   If streams fail to play, try using a different source or accessing
+ *   videasy.to directly in a browser first (to establish Cloudflare cookies).
  */
 
 var { httpGet, httpPost, safeJsonParse, fetchTmdbMeta } = require("./_shared");
@@ -90,25 +85,6 @@ function isValidStreamUrl(url) {
 	return true;
 }
 
-/**
- * Deep-clone an array of subtitle objects.
- * Each stream gets its OWN copy to prevent cross-stream corruption.
- */
-function cloneSubtitles(subs) {
-	if (!subs || !subs.length) return [];
-	var cloned = [];
-	for (var i = 0; i < subs.length; i++) {
-		var s = subs[i];
-		if (!s) continue;
-		cloned.push({
-			url: s.url,
-			label: s.label || s.name || "VTT",
-			lang: s.lang || "",
-		});
-	}
-	return cloned;
-}
-
 async function scrapeStreams(params) {
 	var start = Date.now();
 
@@ -132,7 +108,6 @@ async function scrapeStreams(params) {
 		// ── Step 1: Fetch encrypted payload from videasy API ──
 		var apiUrl = VIDEO_API + "?title=" + title + "&mediaType=" + params.type;
 
-		// Only include year/imdbId/tmdbId if we have them (avoid empty params)
 		if (year) apiUrl += "&year=" + year;
 		if (imdbId) apiUrl += "&imdbId=" + imdbId;
 		apiUrl += "&tmdbId=" + String(params.tmdbId);
@@ -142,9 +117,9 @@ async function scrapeStreams(params) {
 				"&season=" + (params.season || 1) + "&episode=" + (params.episode || 1);
 		}
 
-		// ── Step 1b: Fetch encrypted payload with retries ──
-		// The videasy API is unreliable (500/timeout ~20%) — retry once
+		// ── Step 1b: Fetch with retries (API is unreliable) ──
 		var encryptedText = "";
+		var apiErrors = [];
 		for (var retry = 0; retry < 2; retry++) {
 			try {
 				var raw = await httpGet(apiUrl, {
@@ -154,22 +129,23 @@ async function scrapeStreams(params) {
 				});
 				encryptedText = String(raw).trim();
 				if (encryptedText && encryptedText.length >= 10) break;
-			} catch (_e) {
-				// transient error, retry
+			} catch (e) {
+				apiErrors.push(
+					"attempt " + (retry + 1) + ": " + (e.message || "error"),
+				);
 			}
 			if (retry === 0) {
-				// brief pause before second attempt
 				await new Promise(function (r) {
-					setTimeout(r, 1000);
+					setTimeout(r, 1500);
 				});
 			}
 		}
 
 		if (!encryptedText || encryptedText.length < 10) {
-			return fail("empty response from API after retry");
+			return fail("API returned no data (" + apiErrors.join("; ") + ")");
 		}
 
-		// ── Step 2: Decrypt via enc-dec.app ──
+		// ── Step 2: Decrypt via enc-dec.app (JSON API) ──
 		var decryptRaw = await httpPost(
 			DECRYPT_API,
 			{
@@ -181,37 +157,42 @@ async function scrapeStreams(params) {
 
 		var decryptData = safeJsonParse(decryptRaw);
 		if (!decryptData || decryptData.status !== 200 || !decryptData.result) {
-			return fail("decryption returned no data");
+			return fail("decryption failed");
 		}
 
 		// ── Step 3: Parse sources and subtitles ──
 		var result = decryptData.result;
 		var rawSources = result.sources || [];
 
-		// Build subtitles list (deduplicated by URL + language, deep-cloned per stream)
+		if (!rawSources || rawSources.length === 0) {
+			return fail("no sources in decrypted data");
+		}
+
+		// Build subtitles list (deduplicated by URL)
 		var subs = [];
 		var rawSubs = result.subtitles || [];
 		var seenSubs = {};
 		for (var j = 0; j < rawSubs.length; j++) {
 			var sub = rawSubs[j];
 			if (!sub || !sub.url) continue;
-			var subLang = sub.language || sub.lang || "";
-			var subLabel = sub.label || sub.name || subLang || "Unknown";
-			// Deduplicate by URL to avoid identical subtitle tracks
 			if (seenSubs[sub.url]) continue;
 			seenSubs[sub.url] = true;
+
+			// Use language field as label for proper names
+			var subLabel = sub.language || sub.lang || sub.label || "Unknown";
 			subs.push({
 				url: sub.url,
 				label: subLabel,
-				lang: subLang,
+				lang: sub.language || sub.lang || "",
 			});
 		}
-		// Cap at a reasonable number to avoid overwhelming the player
+
+		// Cap at 30 to avoid overwhelming the player
 		if (subs.length > 30) {
 			subs = subs.slice(0, 30);
 		}
 
-		// ── Step 4: Build streams with per-stream deep-cloned subtitles ──
+		// ── Step 4: Build streams ──
 		var streams = [];
 		for (var i = 0; i < rawSources.length; i++) {
 			var s = rawSources[i];
@@ -226,12 +207,11 @@ async function scrapeStreams(params) {
 					Referer: "https://videasy.to/",
 					Origin: "https://videasy.to",
 				},
-				// 🔴 FIX: Deep-clone subtitles per stream — never share arrays
-				subtitles: subs.length > 0 ? cloneSubtitles(subs) : undefined,
+				subtitles: subs.length > 0 ? subs : undefined,
 			});
 		}
 
-		// Sort by quality descending (highest first)
+		// Sort by quality descending
 		streams.sort(function (a, b) {
 			return qualityRank(b.quality) - qualityRank(a.quality);
 		});

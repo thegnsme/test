@@ -413,6 +413,33 @@ function parseSubtitleTracks(m3u8Content, playlistUrl) {
 // ═════════════════════════════════════════════════════════════════════════
 
 /**
+ * Determine if a URL goes through anyembed's proxy layer.
+ */
+function isProxyUrl(url) {
+	return (
+		typeof url === "string" && url.indexOf("api.anyembed.xyz/api/proxy") !== -1
+	);
+}
+
+/**
+ * Get the correct Origin/Referer headers for a stream URL.
+ * Proxy URLs (api.anyembed.xyz) → anyembed.xyz origin
+ * Direct URLs (vixcloud.co) → vixcloud.co origin
+ */
+function streamHeaders(url, sourceHeaders) {
+	var h = { "User-Agent": UA };
+	if (isProxyUrl(url)) {
+		h.Origin = "https://anyembed.xyz";
+		h.Referer = "https://anyembed.xyz/";
+	} else {
+		h.Origin = (sourceHeaders && sourceHeaders.Origin) || "https://vixcloud.co";
+		h.Referer =
+			(sourceHeaders && sourceHeaders.Referer) || "https://vixcloud.co/";
+	}
+	return h;
+}
+
+/**
  * Build final stream array from API response and parsed HLS playlist.
  *
  * @param {object} apiResult - Result from fetchStreamSources
@@ -462,15 +489,7 @@ function buildStreams(
 				var s = {
 					url: v.url,
 					quality: v.quality || qualityLabel(v.height || 0),
-					headers: {
-						"User-Agent": UA,
-						Origin:
-							(playlistHeaders && playlistHeaders.Origin) ||
-							"https://vixcloud.co",
-						Referer:
-							(playlistHeaders && playlistHeaders.Referer) ||
-							"https://vixcloud.co/",
-					},
+					headers: streamHeaders(v.url, playlistHeaders),
 				};
 
 				// Attach subtitles from playlist (more accurate)
@@ -501,11 +520,7 @@ function buildStreams(
 			if (!st.url || seenUrls[st.url]) continue;
 			seenUrls[st.url] = true;
 
-			var fHeaders = {
-				"User-Agent": UA,
-				Origin: (st.headers && st.headers.Origin) || "https://vixcloud.co",
-				Referer: (st.headers && st.headers.Referer) || "https://vixcloud.co/",
-			};
+			var fHeaders = streamHeaders(st.url, st.headers);
 
 			var fSubs = st.subtitles || apiSubtitles;
 
