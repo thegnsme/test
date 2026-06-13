@@ -9,6 +9,7 @@ var SOURCES_REGISTRY = {
   "mapple.uk": require("./mapple_uk"),
   "anyembed.xyz": require("./anyembed_xyz"),
   vidsrc: require("./vidsrc"),
+  vixsrc: require("./vixsrc"),
 };
 
 var SOURCE_TIMEOUT = 6e4;
