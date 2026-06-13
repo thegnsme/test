@@ -1,310 +1,230 @@
 "use strict";
 
-var SOURCES_REGISTRY = {
-  "vidlink.pro": require("./vidlink_pro"),
-  "videasy.to": require("./videasy_to"),
-  lordflix: require("./lordflix"),
-  ezvidapi: require("./ezvidapi"),
-  "apiplayer.ru": require("./apiplayer_ru"),
-  "mapple.uk": require("./mapple_uk"),
-  vidsrc: require("./vidsrc"),
-  vixsrc: require("./vixsrc"),
-  "vidcore.net": require("./vidcore_net"),
-  "vidking.net": require("./vidking_net"),
-};
+/**
+ * MultiSource aggregator.
+ *
+ * Loads all source modules via static require() and provides
+ * a unified aggregateAll() interface for the main plugin.
+ *
+ * ╔══════════════════════════════════════════════════════════════╗
+ * ║  TO ADD/REMOVE A SOURCE: add/remove one line below in      ║
+ * ║  _sourceEntries. That's the ONLY place to edit.            ║
+ * ╚══════════════════════════════════════════════════════════════╝
+ */
 
-var SOURCE_TIMEOUT = 6e4;
+var TAG = "SourceAggregator";
 
-var MOVIE_TIMEOUT = 35e3;
+// ─── Static Module Loading ────────────────────────────────────────────
+// quick_js_ng only resolves require() with static string literals.
+// Dynamic require("./" + name) does NOT work.
+// Each source is pre-loaded here with its filename + module.
 
-var HEALTH_THRESHOLD = 3;
+var _subtitlesProvider = require("./subtitles_provider");
 
-var HEALTH_RESET_AFTER = 3e5;
+var _sourceEntries = [
+	["apiplayer_ru", require("./apiplayer_ru")],
+	["ezvidapi", require("./ezvidapi")],
+	["lordflix", require("./lordflix")],
+	["mapple_uk", require("./mapple_uk")],
+	["vidcore_net", require("./vidcore_net")],
+	["videasy_to", require("./videasy_to")],
+	["vidking_net", require("./vidking_net")],
+	["vidlink_pro", require("./vidlink_pro")],
+	["vidsrc", require("./vidsrc")],
+	["vixsrc", require("./vixsrc")],
+];
 
-var SOURCE_TIMEOUT_OVERRIDES = {
-  lordflix: 45e3,
-  ezvidapi: 2e4,
-  "vidking.net": 45e3,
-};
+// ─── Build Module Registry ────────────────────────────────────────────
 
-var _health = {};
+var sourceModules = {};
+var sourceNames = [];
 
-function initHealth(name) {
-  if (!_health[name]) {
-    _health[name] = {
-      failures: 0,
-      lastFailure: 0,
-      totalCalls: 0,
-      totalMs: 0,
-    };
-  }
+for (var ei = 0; ei < _sourceEntries.length; ei++) {
+	var entry = _sourceEntries[ei];
+	var filename = entry[0];
+	var mod = entry[1];
+	if (mod && mod.name && typeof mod.scrapeStreams === "function") {
+		sourceModules[mod.name] = mod;
+		sourceNames.push(mod.name);
+	} else {
+		console.warn("[" + TAG + "] Source '" + filename + "' invalid or missing");
+	}
 }
 
-function recordSuccess(name, ms) {
-  initHealth(name);
-  _health[name].failures = 0;
-  _health[name].totalCalls++;
-  _health[name].totalMs += ms;
+console.log(
+	"[" +
+		TAG +
+		"] Loaded " +
+		sourceNames.length +
+		" source(s): " +
+		sourceNames.join(", "),
+);
+
+// ─── Stream URL Validation ────────────────────────────────────────────
+
+function isValidStreamUrl(url) {
+	if (!url || typeof url !== "string") return false;
+	if (url.indexOf("https://") !== 0 && url.indexOf("http://") !== 0)
+		return false;
+	var hostMatch = url.match(/^https?:\/\/([^/]+)/);
+	if (!hostMatch) return false;
+	var host = hostMatch[1].toLowerCase();
+	if (
+		host === "localhost" ||
+		host === "127.0.0.1" ||
+		host.indexOf("169.254.") === 0 ||
+		host.indexOf("10.") === 0 ||
+		host.indexOf("172.16.") === 0 ||
+		host.indexOf("192.168.") === 0
+	)
+		return false;
+	// Reject embed/page URLs that are NOT M3U8
+	var path = url.substring(url.indexOf("/", 8) + 1);
+	if (
+		path.indexOf("embed/") === 0 ||
+		path.indexOf("/embed/") !== -1 ||
+		path.indexOf("tv/") === 0 ||
+		path.indexOf("movie/") === 0
+	) {
+		if (url.indexOf(".m3u8") === -1 && url.indexOf(".m3u") === -1) return false;
+	}
+	return true;
 }
 
-function recordFailure(name) {
-  initHealth(name);
-  _health[name].failures++;
-  _health[name].lastFailure = Date.now();
-  _health[name].totalCalls++;
-}
+// ─── Aggregation ──────────────────────────────────────────────────────
 
-function isHealthy(name) {
-  initHealth(name);
-  var h = _health[name];
-  if (h.failures >= HEALTH_THRESHOLD) {
-    if (Date.now() - h.lastFailure < HEALTH_RESET_AFTER) {
-      return false;
-    }
-    h.failures = 0;
-  }
-  return true;
-}
+/**
+ * Call all sources in parallel for given content.
+ * Each source returns { source, status, streams, latency_ms }.
+ * Streams with invalid URLs or embed pages are filtered out.
+ */
+function aggregateAll(tmdbId, type, season, episode) {
+	var start = Date.now();
+	var params = {
+		tmdbId: tmdbId,
+		type: type,
+		season: season || 1,
+		episode: episode || 1,
+	};
 
-function getHealthReport() {
-  var report = {};
-  for (var name in _health) {
-    var h = _health[name];
-    report[name] = {
-      healthy: h.failures < HEALTH_THRESHOLD,
-      failures: h.failures,
-      totalCalls: h.totalCalls,
-      avgMs: h.totalCalls > 0 ? Math.round(h.totalMs / h.totalCalls) : 0,
-    };
-  }
-  return report;
-}
+	var PER_SOURCE_TIMEOUT = 35000; // 35s max per source
 
-function classifyError(err) {
-  if (!err) return "unknown";
-  var msg = String(err.message || err).toLowerCase();
-  if (msg.indexOf("timeout") !== -1) return "timeout";
-  if (msg.indexOf("econnrefused") !== -1) return "connection_refused";
-  if (msg.indexOf("enotfound") !== -1 || msg.indexOf("dns") !== -1)
-    return "dns_error";
-  if (msg.indexOf("etimedout") !== -1) return "connection_timeout";
-  if (msg.indexOf("parse") !== -1 || msg.indexOf("json") !== -1)
-    return "parse_error";
-  if (msg.indexOf("429") !== -1 || msg.indexOf("rate limit") !== -1)
-    return "rate_limited";
-  if (msg.indexOf("403") !== -1 || msg.indexOf("forbidden") !== -1)
-    return "forbidden";
-  if (msg.indexOf("404") !== -1 || msg.indexOf("not found") !== -1)
-    return "not_found";
-  return "unknown";
+	var promises = [];
+	for (var si = 0; si < sourceNames.length; si++) {
+		var name = sourceNames[si];
+		var mod = sourceModules[name];
+		(function (srcName, module) {
+			promises.push(
+				Promise.race([
+					module.scrapeStreams(params),
+					new Promise(function (resolve) {
+						setTimeout(function () {
+							resolve({
+								source: srcName,
+								status: "error",
+								error: "timeout (" + PER_SOURCE_TIMEOUT + "ms)",
+								streams: [],
+								latency_ms: PER_SOURCE_TIMEOUT,
+							});
+						}, PER_SOURCE_TIMEOUT);
+					}),
+				])
+					.then(function (result) {
+						if (!result) {
+							return {
+								source: srcName,
+								status: "error",
+								error: "no result",
+								streams: [],
+								latency_ms: Date.now() - start,
+							};
+						}
+						// Normalize result
+						if (!result.streams) result.streams = [];
+						if (!Array.isArray(result.streams)) {
+							result.streams = [result.streams];
+						}
+						result.source = result.source || srcName;
+
+						// Validate stream URLs — reject embed pages and invalid URLs
+						var valid = [];
+						for (var vi = 0; vi < result.streams.length; vi++) {
+							var s = result.streams[vi];
+							if (s && s.url && isValidStreamUrl(s.url)) {
+								valid.push(s);
+							}
+						}
+						result.streams = valid;
+
+						return result;
+					})
+					.catch(function (e) {
+						return {
+							source: srcName,
+							status: "error",
+							error: e && e.message ? e.message : String(e),
+							streams: [],
+							latency_ms: Date.now() - start,
+						};
+					}),
+			);
+		})(name, mod);
+	}
+
+	return Promise.all(promises).then(function (results) {
+		var workingSources = 0;
+		var totalStreams = 0;
+		var debugLines = [];
+		for (var ri = 0; ri < results.length; ri++) {
+			var r = results[ri];
+			if (r.status === "working") {
+				workingSources++;
+				totalStreams += r.streams.length;
+			} else {
+				debugLines.push(
+					r.source +
+						"=" +
+						(r.status || "error") +
+						(r.error ? ":" + r.error : ""),
+				);
+			}
+		}
+		if (debugLines.length > 0) {
+			console.log("[" + TAG + "] Failed: " + debugLines.join(", "));
+		}
+		console.log(
+			"[" +
+				TAG +
+				"] " +
+				workingSources +
+				"/" +
+				sourceNames.length +
+				" sources returned " +
+				totalStreams +
+				" streams in " +
+				(Date.now() - start) +
+				"ms",
+		);
+		return {
+			success: true,
+			sources: results,
+			workingSources: workingSources,
+			totalSources: sourceNames.length,
+			totalStreams: totalStreams,
+			elapsed_ms: Date.now() - start,
+		};
+	});
 }
 
 function listSources() {
-  return Object.keys(SOURCES_REGISTRY);
-}
-
-var sourceCount = Object.keys(SOURCES_REGISTRY).length;
-
-async function aggregateAll(tmdbId, type, season, episode) {
-  var start = Date.now();
-  var params = {
-    tmdbId: parseInt(tmdbId, 10) || 0,
-    type: type === "tv" ? "tv" : "movie",
-    season: parseInt(season, 10) || 1,
-    episode: parseInt(episode, 10) || 1,
-  };
-  var defaultTimeout = type === "tv" ? SOURCE_TIMEOUT : MOVIE_TIMEOUT;
-  var names = Object.keys(SOURCES_REGISTRY);
-  var sourceTasks = [];
-  for (var si = 0; si < names.length; si++) {
-    var name = names[si];
-    var src = SOURCES_REGISTRY[name];
-    if (!isHealthy(name)) {
-      console.log(
-        "[MultiSource:Health] Skipping " +
-          name +
-          " (" +
-          _health[name].failures +
-          " consecutive failures)",
-      );
-      sourceTasks.push(
-        Promise.resolve({
-          source: name,
-          status: "unhealthy",
-          error:
-            "temporarily disabled after " +
-            _health[name].failures +
-            " failures",
-          streams: [],
-          latency_ms: 0,
-        }),
-      );
-      continue;
-    }
-    var srcTimeout = SOURCE_TIMEOUT_OVERRIDES[name] || defaultTimeout;
-    var task = (function (srcName, srcModule, srcTimeout) {
-      var srcStart = Date.now();
-      var timeoutPromise = new Promise(function (_, reject) {
-        setTimeout(function () {
-          reject(new Error("timeout after " + srcTimeout + "ms"));
-        }, srcTimeout);
-      });
-      return Promise.race([
-        Promise.resolve()
-          .then(function () {
-            return srcModule.scrapeStreams(params);
-          })
-          .then(function (result) {
-            var ms = Date.now() - srcStart;
-            if (
-              result &&
-              result.status === "working" &&
-              result.streams &&
-              result.streams.length > 0
-            ) {
-              recordSuccess(srcName, ms);
-              console.log(
-                "[MultiSource:Source] " +
-                  srcName +
-                  " ✓ " +
-                  result.streams.length +
-                  " streams (" +
-                  ms +
-                  "ms)",
-              );
-            } else {
-              recordFailure(srcName);
-              var errMsg = (result && result.error) || "no streams";
-              console.log(
-                "[MultiSource:Source] " +
-                  srcName +
-                  " ✗ " +
-                  errMsg +
-                  " (" +
-                  ms +
-                  "ms)",
-              );
-            }
-            if (!result || typeof result !== "object") {
-              return {
-                source: srcName,
-                status: "error",
-                error: "invalid return value",
-                streams: [],
-                latency_ms: ms,
-              };
-            }
-            if (!result.source) result.source = srcName;
-            result.latency_ms = ms;
-            return result;
-          })
-          .catch(function (err) {
-            var ms = Date.now() - srcStart;
-            recordFailure(srcName);
-            var category = classifyError(err);
-            console.log(
-              "[MultiSource:Error] " +
-                srcName +
-                " failed: " +
-                (err.message || err) +
-                " (" +
-                category +
-                ", " +
-                ms +
-                "ms)",
-            );
-            return {
-              source: srcName,
-              status: "error",
-              error: err.message || String(err),
-              errorCategory: category,
-              streams: [],
-              latency_ms: ms,
-            };
-          }),
-        timeoutPromise,
-      ]).catch(function (err) {
-        var ms = Date.now() - srcStart;
-        recordFailure(srcName);
-        console.log(
-          "[MultiSource:Error] " +
-            srcName +
-            " rejected by timeout: " +
-            (err.message || err),
-        );
-        return {
-          source: srcName,
-          status: "error",
-          error: err.message || "timeout",
-          errorCategory: "timeout",
-          streams: [],
-          latency_ms: ms,
-        };
-      });
-    })(name, src, srcTimeout);
-    sourceTasks.push(task);
-  }
-  var results = await Promise.allSettled(sourceTasks);
-  var sourcesOut = [];
-  for (var i = 0; i < results.length; i++) {
-    var r = results[i];
-    if (r.status === "fulfilled") {
-      sourcesOut.push(r.value);
-    } else {
-      sourcesOut.push({
-        source: names[i] || "unknown",
-        status: "error",
-        error: (r.reason && r.reason.message) || "unknown failure",
-        streams: [],
-        latency_ms: Date.now() - start,
-      });
-    }
-  }
-  var working = 0;
-  for (var w = 0; w < sourcesOut.length; w++) {
-    if (
-      sourcesOut[w].status === "working" &&
-      sourcesOut[w].streams &&
-      sourcesOut[w].streams.length > 0
-    )
-      working++;
-  }
-  var allUrls = [];
-  for (var u = 0; u < sourcesOut.length; u++) {
-    var srcStreams = sourcesOut[u].streams || [];
-    for (var v = 0; v < srcStreams.length; v++) allUrls.push(srcStreams[v].url);
-  }
-  var uniqueUrls = {};
-  for (var ui = 0; ui < allUrls.length; ui++) {
-    uniqueUrls[allUrls[ui]] = true;
-  }
-  var STATUS_ORDER = {
-    working: 0,
-    embed: 1,
-    no_streams: 2,
-    unavailable: 3,
-    unhealthy: 4,
-    error: 5,
-  };
-  sourcesOut.sort(function (a, b) {
-    return (STATUS_ORDER[a.status] || 99) - (STATUS_ORDER[b.status] || 99);
-  });
-  return {
-    success: true,
-    tmdbId: parseInt(tmdbId, 10),
-    type: type,
-    workingSources: working,
-    totalSources: names.length,
-    totalStreams: Object.keys(uniqueUrls).length,
-    elapsed_ms: Date.now() - start,
-    sources: sourcesOut,
-    health: getHealthReport(),
-  };
+	return sourceNames.slice();
 }
 
 module.exports = {
-  aggregateAll: aggregateAll,
-  listSources: listSources,
-  sourceCount: sourceCount,
-  getHealthReport: getHealthReport,
+	aggregateAll: aggregateAll,
+	listSources: listSources,
+	sourceCount: sourceNames.length,
+	getSubtitleProvider: function () {
+		return _subtitlesProvider;
+	},
 };
