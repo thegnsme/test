@@ -1,9 +1,9 @@
 {
-  "name": "test",
-  "packageName": "com.multisource.streams",
-  "description": "Streaming plugins collection — MultiSource (TMDB) and TeluguPrazalu (teluguprazalu.com)",
-  "manifestVersion": 1,
-  "pluginLists": [
-    "https://raw.githubusercontent.com/thegnsme/test/repo/dist/plugins.json"
-  ]
+	"name": "test",
+	"packageName": "com.multisource.streams",
+	"description": "Streaming plugins collection — MultiSource (TMDB) and TeluguPrazalu (teluguprazalu.com)",
+	"manifestVersion": 1,
+	"pluginLists": [
+		"https://raw.githubusercontent.com/thegnsme/test/sourcetest/dist/plugins.json"
+	]
 }
