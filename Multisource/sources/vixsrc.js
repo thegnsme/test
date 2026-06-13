@@ -328,43 +328,22 @@ async function scrapeStreams(opts) {
     var playlistText = await fetchPlaylist(playlistUrl, embedUrl, 2);
     var parsed = parseMasterPlaylist(playlistText, embedUrl);
 
-    var streams = [];
-
+    var maxLabel = "Auto";
     if (parsed.qualities.length > 0) {
-      for (var qi = 0; qi < parsed.qualities.length; qi++) {
-        var q = parsed.qualities[qi];
-        var qUrl = q.url;
-        if (qUrl.indexOf("http") !== 0) {
-          if (qUrl.indexOf("/") === 0) {
-            var slash3 = playlistUrl.indexOf("/", 8);
-            qUrl = playlistUrl.substring(0, slash3) + qUrl;
-          } else {
-            var lastSlash = playlistUrl.lastIndexOf("/");
-            qUrl = playlistUrl.substring(0, lastSlash + 1) + qUrl;
-          }
-        }
-        streams.push({
-          url: qUrl,
-          source: SOURCE_NAME + " [" + q.label + "]",
-          headers: {
-            "User-Agent": UA,
-            Referer: embedUrl,
-          },
-        });
-      }
+      maxLabel = parsed.maxLabel || "Auto";
     }
 
-    if (streams.length === 0) {
-      var autoLabel = parsed.maxLabel || "Auto";
-      streams.push({
+    var streams = [
+      {
         url: playlistUrl,
-        source: SOURCE_NAME + " [" + autoLabel + "]",
+        source: SOURCE_NAME,
+        quality: maxLabel,
         headers: {
           "User-Agent": UA,
           Referer: embedUrl,
         },
-      });
-    }
+      },
+    ];
 
     return {
       source: SOURCE_NAME,
