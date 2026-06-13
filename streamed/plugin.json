@@ -1,0 +1,24 @@
+{
+	"packageName": "com.streamed.live",
+	"name": "Streamed",
+	"version": 1,
+	"baseUrl": "https://streami.su",
+	"description": "Live sports streaming from Streamed — football, basketball, tennis, cricket, MMA and more. Dynamically fetches live events with real-time domain resolution and multi-level embed extraction.",
+	"authors": ["Streamed Plugin Team"],
+	"languages": ["en"],
+	"categories": ["LiveTv"],
+	"domains": [
+		{
+			"name": "streami.su",
+			"url": "https://streami.su"
+		},
+		{
+			"name": "streamed.pk",
+			"url": "https://streamed.pk"
+		},
+		{
+			"name": "streamed.st",
+			"url": "https://streamed.st"
+		}
+	]
+}
