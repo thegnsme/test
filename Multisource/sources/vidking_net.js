@@ -1,1190 +1,703 @@
-/**
- * VidKing Source for Skystream MultiSource Plugin
- *
- * Extracts DDL, M3U8 HLS streams, and direct video links from vidking.net
- *
- * Architecture:
- *   vidking.net is a React SPA video player that uses the same backend
- *   infrastructure as videasy.to (api.videasy.to). It supports 4 server
- *   backends: Oxygen, Hydrogen, Lithium, Helium.
- *
- * Flow:
- *   1. Fetch TMDB metadata (title, year, imdb_id)
- *   2. Call api.videasy.to with multiple server fallbacks
- *   3. Decrypt response using enc-dec.app
- *   4. Parse decrypted streams into StreamResult objects
- *   5. Extract M3U8 multi-quality variants when available
- *   6. Fallback: return embed URL as playable stream
- *
- * @module sources/vidking_net
- */
-
 "use strict";
 
-// ─── Helper Functions ───────────────────────────────────────────────────────
-
 function safeJsonParse(str) {
-  if (!str || typeof str !== "string") return null;
-  try {
-    return JSON.parse(str);
-  } catch (e) {
-    return null;
-  }
+	if (!str || typeof str !== "string") return null;
+	try {
+		return JSON.parse(str);
+	} catch (e) {
+		return null;
+	}
 }
 
 function makeFail(src, msg, start) {
-  return {
-    source: src,
-    status: "error",
-    error: msg || "unknown",
-    streams: [],
-    latency_ms: Date.now() - (start || Date.now()),
-  };
+	return {
+		source: src,
+		status: "error",
+		error: msg || "unknown",
+		streams: [],
+		latency_ms: Date.now() - (start || Date.now()),
+	};
 }
 
 function extractQuality(url) {
-  var u = String(url || "");
-  var m = u.match(/(2160p|1440p|1080p|720p|480p|360p)/i);
-  if (m) return m[1].toLowerCase();
-  if (/\b4k\b/i.test(u)) return "4K";
-  return "";
+	var u = String(url || "");
+	var m = u.match(/(2160p|1440p|1080p|720p|480p|360p)/i);
+	if (m) return m[1].toLowerCase();
+	if (/\b4k\b/i.test(u)) return "4K";
+	return "";
 }
 
 function qualityLabel(h) {
-  if (h >= 2160) return "2160p";
-  if (h >= 1440) return "1440p";
-  if (h >= 1080) return "1080p";
-  if (h >= 720) return "720p";
-  if (h >= 480) return "480p";
-  if (h >= 360) return "360p";
-  return h ? h + "p" : "Auto";
+	if (h >= 2160) return "2160p";
+	if (h >= 1440) return "1440p";
+	if (h >= 1080) return "1080p";
+	if (h >= 720) return "720p";
+	if (h >= 480) return "480p";
+	if (h >= 360) return "360p";
+	return h ? h + "p" : "Auto";
 }
 
 function qualityRank(q) {
-  var qs = String(q || "").toLowerCase();
-  if (qs.indexOf("2160") !== -1 || qs === "4k") return 7;
-  if (qs.indexOf("1440") !== -1 || qs === "2k") return 6;
-  if (qs.indexOf("1080") !== -1) return 5;
-  if (qs.indexOf("720") !== -1) return 4;
-  if (qs.indexOf("480") !== -1) return 3;
-  if (qs.indexOf("360") !== -1) return 2;
-  if (qs.indexOf("240") !== -1) return 1;
-  return 0;
-}
-
-function isValidStreamUrl(url) {
-  if (!url || typeof url !== "string") return false;
-  if (url.indexOf("https://") !== 0 && url.indexOf("http://") !== 0)
-    return false;
-  var hostMatch = url.match(/^https?:\/\/([^/]+)/);
-  if (!hostMatch) return false;
-  var host = hostMatch[1].toLowerCase();
-  if (
-    host === "localhost" ||
-    host === "127.0.0.1" ||
-    host.indexOf("169.254.") === 0 ||
-    host.indexOf("10.") === 0 ||
-    host.indexOf("172.16.") === 0 ||
-    host.indexOf("192.168.") === 0
-  ) {
-    return false;
-  }
-  return true;
-}
-
-function resolveRelativeUrl(baseUrl, relativePath) {
-  if (!baseUrl) return relativePath;
-  if (relativePath.indexOf("//") === 0) return "https:" + relativePath;
-  if (relativePath.indexOf("/") === 0) {
-    var originMatch = baseUrl.match(/^(https?:\/\/[^/]+)/);
-    return (originMatch ? originMatch[1] : "") + relativePath;
-  }
-  return baseUrl.replace(/\/[^/]*$/, "/") + relativePath;
+	var qs = String(q || "").toLowerCase();
+	if (qs.indexOf("2160") !== -1 || qs === "4k") return 7;
+	if (qs.indexOf("1440") !== -1 || qs === "2k") return 6;
+	if (qs.indexOf("1080") !== -1) return 5;
+	if (qs.indexOf("720") !== -1) return 4;
+	if (qs.indexOf("480") !== -1) return 3;
+	if (qs.indexOf("360") !== -1) return 2;
+	if (qs.indexOf("240") !== -1) return 1;
+	return 0;
 }
 
 function copyHeaders(obj) {
-  if (!obj || typeof obj !== "object") return {};
-  var out = {};
-  for (var k in obj) {
-    if (Object.prototype.hasOwnProperty.call(obj, k))
-      if (obj[k] != null) out[k] = obj[k];
-  }
-  return out;
+	if (!obj || typeof obj !== "object") return {};
+	var out = {};
+	for (var k in obj) {
+		if (Object.prototype.hasOwnProperty.call(obj, k))
+			if (obj[k] != null) out[k] = obj[k];
+	}
+	return out;
 }
 
-// ─── HTTP Helpers ───────────────────────────────────────────────────────────
-
-var REQUEST_TIMEOUT = 15000;
-var UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36";
+function resolveRelativeUrl(baseUrl, relativePath) {
+	if (!baseUrl) return relativePath;
+	if (relativePath.indexOf("//") === 0) return "https:" + relativePath;
+	if (relativePath.indexOf("/") === 0) {
+		var originMatch = baseUrl.match(/^(https?:\/\/[^/]+)/);
+		return (originMatch ? originMatch[1] : "") + relativePath;
+	}
+	return baseUrl.replace(/\/[^/]*$/, "/") + relativePath;
+}
 
 async function httpGet(url, headers) {
-  var raw = await globalThis.http_get(url, headers || {});
-  if (typeof raw === "string") return raw;
-  if (raw && raw.body) {
-    if (typeof raw.body === "string") return raw.body;
-    if (typeof raw.body === "object") return JSON.stringify(raw.body);
-  }
-  return "";
+	var raw = await globalThis.http_get(url, headers || {});
+	if (typeof raw === "string") return raw;
+	if (raw && raw.body) {
+		if (typeof raw.body === "string") return raw.body;
+		if (typeof raw.body === "object") return JSON.stringify(raw.body);
+	}
+	return "";
 }
 
 async function httpPost(url, headers, body) {
-  var raw = await globalThis.http_post(url, headers || {}, body || "");
-  if (typeof raw === "string") return raw;
-  if (raw && raw.body) {
-    if (typeof raw.body === "string") return raw.body;
-    if (typeof raw.body === "object") return JSON.stringify(raw.body);
-  }
-  return "";
+	var raw = await globalThis.http_post(url, headers || {}, body || "");
+	if (typeof raw === "string") return raw;
+	if (raw && raw.body) {
+		if (typeof raw.body === "string") return raw.body;
+		if (typeof raw.body === "object") return JSON.stringify(raw.body);
+	}
+	return "";
 }
-
-function withTimeout(promise, ms, label) {
-  return Promise.race([
-    promise,
-    new Promise(function (_, reject) {
-      setTimeout(function () {
-        reject(new Error((label || "request") + " timeout after " + ms + "ms"));
-      }, ms);
-    }),
-  ]);
-}
-
-// ─── Subtitle Parsing from M3U8 ─────────────────────────────────────────────
-
-function extractSubtitlesFromM3U8(m3u8Content, playlistUrl) {
-  if (!m3u8Content) return [];
-  var lines = String(m3u8Content).split("\n");
-  var tracks = [];
-  var seen = {};
-  for (var i = 0; i < lines.length; i++) {
-    var line = lines[i];
-    if (line.indexOf("#EXT-X-MEDIA:TYPE=SUBTITLES") !== -1) {
-      var urlMatch = line.match(/URI="([^"]+)"/);
-      var langMatch = line.match(/LANGUAGE="([^"]+)"/);
-      var nameMatch = line.match(/NAME="([^"]+)"/);
-      if (urlMatch && urlMatch[1] && !seen[urlMatch[1]]) {
-        seen[urlMatch[1]] = true;
-        var subUrl = urlMatch[1];
-        if (subUrl.indexOf("http") !== 0 && playlistUrl) {
-          subUrl = resolveRelativeUrl(playlistUrl, subUrl);
-        }
-        tracks.push({
-          url: subUrl,
-          label: (nameMatch && nameMatch[1]) || "Subtitle",
-          lang: (langMatch && langMatch[1]) || "en",
-        });
-      }
-    }
-  }
-  return tracks;
-}
-
-// ─── TMDB Metadata ──────────────────────────────────────────────────────────
-
-var TMDB_KEYS = [
-  "68e094699525b18a70bab2f86b1fa706",
-  "af3a53eb387d57fc935e9128468b1899",
-  "0142a22c560ce3efb1cfd6f3b2faab77",
-];
-var _tmdbIdx = 0;
-function tmdbKey() {
-  return TMDB_KEYS[_tmdbIdx++ % TMDB_KEYS.length];
-}
-
-var _metaCache = {};
-async function fetchTmdbMeta(tmdbId, type) {
-  var key = String(tmdbId) + ":" + (type || "movie");
-  if (_metaCache[key] !== undefined) return _metaCache[key];
-  try {
-    var endpoint = type === "tv" ? "/tv/" : "/movie/";
-    var url =
-      "https://api.themoviedb.org/3" +
-      endpoint +
-      String(tmdbId) +
-      "?api_key=" +
-      tmdbKey() +
-      "&append_to_response=external_ids";
-    var resp = await httpGet(url, {
-      "User-Agent": UA,
-      Accept: "application/json",
-    });
-    var data = safeJsonParse(resp);
-    if (!data) {
-      _metaCache[key] = null;
-      return null;
-    }
-    var title = data.title || data.name || "";
-    var date = data.release_date || data.first_air_date || "";
-    var year = date ? date.split("-")[0] : "";
-    var imdbId =
-      data.external_ids && data.external_ids.imdb_id
-        ? data.external_ids.imdb_id
-        : data.imdb_id || "";
-    var result = { title: title, year: year, imdb_id: imdbId };
-    _metaCache[key] = result;
-    return result;
-  } catch (e) {
-    return null;
-  }
-}
-
-// ─── Source Configuration ───────────────────────────────────────────────────
 
 var SOURCE_NAME = "vidking.net";
-
 var VIDKING_BASE = "https://www.vidking.net";
 var VIDEO_API_BASE = "https://api.videasy.to";
 var DECRYPT_API = "https://enc-dec.app/api/dec-videasy";
+var UA =
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36";
+var REQ_TIMEOUT = 10000;
+var TOTAL_TIMEOUT = 45000;
 
-/**
- * Server backends supported by VidKing infrastructure.
- * Tried in order: Oxygen → Hydrogen → Lithium → Helium
- * Hydrogen is the most reliable (same as videasy.to)
- */
+// Servers to try — using only fastest endpoints
 var SERVERS = [
-  {
-    name: "Oxygen",
-    endpoint: "mb-flix/sources-with-title",
-    isActive: true,
-  },
-  {
-    name: "Hydrogen",
-    endpoint: "cdn/sources-with-title",
-    isActive: true,
-  },
-  {
-    name: "Lithium",
-    endpoint: "downloader2/sources-with-title",
-    isActive: true,
-  },
-  {
-    name: "Helium",
-    endpoint: "1movies/sources-with-title",
-    isActive: true,
-  },
+	{ name: "Hydrogen", endpoint: "cdn/sources-with-title", isActive: true },
+	{ name: "Oxygen", endpoint: "mb-flix/sources-with-title", isActive: true },
+	{
+		name: "Lithium",
+		endpoint: "downloader2/sources-with-title",
+		isActive: true,
+	},
+	{ name: "Helium", endpoint: "1movies/sources-with-title", isActive: true },
 ];
 
-var SERVER_NAMES = SERVERS.map(function (s) {
-  return s.name;
-});
+// ─── TMDB Meta (cached, fast, uses same pattern as other sources) ───
 
-var HEADERS = {
-  "User-Agent": UA,
-  "Accept-Language": "en-US,en;q=0.9",
-  Origin: VIDKING_BASE,
-  Referer: VIDKING_BASE + "/",
-};
+var TMDB_KEYS = [
+	"68e094699525b18a70bab2f86b1fa706",
+	"af3a53eb387d57fc935e9128468b1899",
+	"0142a22c560ce3efb1cfd6f3b2faab77",
+];
+var _tmdbIdx = 0;
+function tmdbKey() {
+	return TMDB_KEYS[_tmdbIdx++ % TMDB_KEYS.length];
+}
+var _metaCache = {};
 
-// ─── API Functions ──────────────────────────────────────────────────────────
-
-/**
- * Build the API URL for a given server and content parameters.
- */
-function buildApiUrl(serverEndpoint, params) {
-  var url = VIDEO_API_BASE + "/" + serverEndpoint;
-
-  var queryParts = [];
-  queryParts.push("title=" + encodeURIComponent(params.title || ""));
-  queryParts.push("mediaType=" + encodeURIComponent(params.type));
-  queryParts.push("year=" + encodeURIComponent(params.year || ""));
-  queryParts.push("tmdbId=" + encodeURIComponent(String(params.tmdbId)));
-  queryParts.push("imdbId=" + encodeURIComponent(params.imdbId || ""));
-  queryParts.push("seasonId=" + encodeURIComponent(String(params.season || 1)));
-  queryParts.push(
-    "episodeId=" + encodeURIComponent(String(params.episode || 1)),
-  );
-
-  // Add cache-busting timestamp
-  queryParts.push("_t=" + Date.now());
-
-  return url + "?" + queryParts.join("&");
+async function fetchTmdbMeta(tmdbId, type) {
+	var key = String(tmdbId) + ":" + (type || "movie");
+	if (_metaCache[key] !== undefined) return _metaCache[key];
+	try {
+		var url =
+			"https://api.themoviedb.org/3/" +
+			(type === "tv" ? "tv" : "movie") +
+			"/" +
+			String(tmdbId) +
+			"?api_key=" +
+			tmdbKey() +
+			"&append_to_response=external_ids";
+		var resp = await httpGet(url, {
+			"User-Agent": UA,
+			Accept: "application/json",
+		});
+		var data = safeJsonParse(resp);
+		if (!data) {
+			_metaCache[key] = null;
+			return null;
+		}
+		var result = {
+			title: data.title || data.name || "",
+			year:
+				(data.release_date || data.first_air_date || "").split("-")[0] || "",
+			imdb_id:
+				(data.external_ids && data.external_ids.imdb_id) || data.imdb_id || "",
+		};
+		_metaCache[key] = result;
+		return result;
+	} catch (e) {
+		return null;
+	}
 }
 
-/**
- * Try to fetch encrypted sources from a single server.
- * @returns {{ name: string, text: string }|null} Object with server name and encrypted text, or null on failure.
- */
-async function trySingleServer(server, params) {
-  var apiUrl = buildApiUrl(server.endpoint, params);
-  try {
-    var resp = await withTimeout(
-      httpGet(apiUrl, {
-        "User-Agent": UA,
-        "Cache-Control": "no-cache",
-        Pragma: "no-cache",
-        Origin: VIDKING_BASE,
-        Referer: VIDKING_BASE + "/",
-      }),
-      REQUEST_TIMEOUT,
-      server.name + " api",
-    );
-    if (!resp || resp.length < 10) return null;
-    return { name: server.name, text: resp };
-  } catch (e) {
-    return null;
-  }
-}
+// ─── M3U8 Expansion ───
 
-/**
- * Race a list of promises and return results from the first N that fulfill
- * with a truthy value matching the filter predicate. Stops waiting once the
- * target count is reached or all promises resolve/reject.
- *
- * @param {Array<Promise>} promises - Array of tagged promises
- * @param {number} maxResults - Stop after collecting this many valid results
- * @param {Function} filter - Predicate to determine valid results
- * @returns {Promise<Array>} Array of valid results (0 to maxResults)
- */
-async function raceToN(promises, maxResults, filter) {
-  var results = [];
-  var pending = promises.slice();
-
-  while (pending.length > 0 && results.length < maxResults) {
-    var winner = await Promise.race(
-      pending.map(function (p, idx) {
-        return p.then(function (v) {
-          return { index: idx, value: v };
-        });
-      }),
-    );
-    pending.splice(winner.index, 1);
-    if (filter(winner.value)) {
-      results.push(winner.value);
-    }
-  }
-  return results;
-}
-
-/**
- * Fetch encrypted sources from ALL servers in PARALLEL.
- * Uses a "race to first 2" pattern: returns as soon as 2 servers respond,
- * without waiting for the rest to time out.
- *
- * @param {Object} params - Content parameters with title, type, year, tmdbId, etc.
- * @returns {Promise<Array<{name:string, text:string}>>}
- */
-async function tryAllServers(params) {
-  var promises = [];
-  for (var si = 0; si < SERVERS.length; si++) {
-    var server = SERVERS[si];
-    if (!server.isActive) continue;
-    console.log("[VidKing] Fetching " + server.name + " server...");
-    promises.push(trySingleServer(server, params));
-  }
-
-  if (promises.length === 0) return [];
-
-  // Race to first 2 successful responses
-  var results = await raceToN(promises, 2, function (v) {
-    return v && v.text && v.text.length >= 10;
-  });
-
-  // Log results
-  for (var ri = 0; ri < results.length; ri++) {
-    console.log(
-      "[VidKing] " +
-        results[ri].name +
-        " responded (" +
-        results[ri].text.length +
-        " chars)",
-    );
-  }
-
-  // Log which servers didn't contribute (best-effort)
-  var successNames = results.map(function (r) {
-    return r.name;
-  });
-  for (var si2 = 0; si2 < SERVERS.length; si2++) {
-    if (
-      SERVERS[si2].isActive &&
-      successNames.indexOf(SERVERS[si2].name) === -1
-    ) {
-      console.log("[VidKing] " + SERVERS[si2].name + " did not respond");
-    }
-  }
-
-  return results;
-}
-
-/**
- * Decrypt a single API response using enc-dec.app.
- * The encrypted text from api.videasy.to uses the same format
- * as videasy.to, so enc-dec.app/api/dec-videasy can decrypt it.
- *
- * @returns {{ name: string, result: Object }|null} Object with server name and decrypted result, or null.
- */
-async function decryptSingleResponse(encryptedText, tmdbId, serverName) {
-  if (!encryptedText || encryptedText.length < 10) return null;
-  try {
-    var decryptRaw = await withTimeout(
-      httpPost(
-        DECRYPT_API,
-        { "Content-Type": "application/json", "User-Agent": UA },
-        JSON.stringify({ text: encryptedText, id: String(tmdbId) }),
-      ),
-      REQUEST_TIMEOUT,
-      "decrypt " + (serverName || ""),
-    );
-    var decryptData = safeJsonParse(decryptRaw);
-    if (!decryptData || decryptData.status !== 200 || !decryptData.result) {
-      return null;
-    }
-    return { name: serverName, result: decryptData.result };
-  } catch (e) {
-    return null;
-  }
-}
-
-/**
- * Decrypt multiple server responses IN PARALLEL.
- * Uses "race to first 2" pattern so we don't wait for slow/failing decrypts.
- *
- * @param {Array<{name:string, text:string}>} serverResponses - Output from tryAllServers
- * @param {number|string} tmdbId
- * @returns {Promise<Array<{name:string, result:Object}>>} Array of successful decryptions
- */
-async function decryptAllResponses(serverResponses, tmdbId) {
-  if (!serverResponses || serverResponses.length === 0) return [];
-
-  var decryptPromises = [];
-  for (var i = 0; i < serverResponses.length; i++) {
-    var sr = serverResponses[i];
-    console.log("[VidKing] Decrypting " + sr.name + " response...");
-    decryptPromises.push(decryptSingleResponse(sr.text, tmdbId, sr.name));
-  }
-
-  // Race to first 2 successful decryptions
-  var results = await raceToN(decryptPromises, 2, function (v) {
-    return v && v.result;
-  });
-
-  for (var ri = 0; ri < results.length; ri++) {
-    console.log("[VidKing] " + results[ri].name + " decrypted successfully");
-  }
-
-  return results;
-}
-
-/**
- * Merge streams from multiple server results into a single deduplicated array.
- * Streams from earlier servers in the list take priority on URL conflict.
- *
- * @param {Array<{name:string, result:Object}>} decryptedResults - Array of {name, result} from decryptAllResponses
- * @returns {Promise<Array>} Unified array of stream objects
- */
-async function mergeServerResults(decryptedResults) {
-  if (!decryptedResults || decryptedResults.length === 0) return [];
-
-  // Build streams from each server, then merge with dedup
-  var allStreams = [];
-  var seenUrls = {};
-  var serverContributions = {};
-
-  for (var ri = 0; ri < decryptedResults.length; ri++) {
-    var dr = decryptedResults[ri];
-    if (!dr || !dr.result) continue;
-
-    var serverName = dr.name || "Unknown";
-    var rawSources = dr.result.sources || [];
-    var rawSubtitles = dr.result.subtitles || [];
-
-    if (rawSources.length === 0) continue;
-
-    // Build streams from this server's result using the existing builder
-    var serverStreams = await buildStreamsFromResult(
-      { sources: rawSources, subtitles: rawSubtitles },
-      { tmdbId: 0, type: "" }, // params not used by buildStreamsFromResult currently
-    );
-
-    // Tag each stream with its source server and deduplicate
-    var deduped = [];
-    for (var si = 0; si < serverStreams.length; si++) {
-      var stream = serverStreams[si];
-      if (seenUrls[stream.url]) continue;
-      seenUrls[stream.url] = true;
-
-      // Add server attribution for debugging
-      stream.sourceServer = serverName;
-
-      deduped.push(stream);
-    }
-
-    if (deduped.length > 0) {
-      serverContributions[serverName] = deduped.length;
-      allStreams = allStreams.concat(deduped);
-    }
-  }
-
-  // Log server contribution summary
-  var contribMsg = Object.keys(serverContributions)
-    .map(function (sn) {
-      return sn + ": " + serverContributions[sn] + " streams";
-    })
-    .join(", ");
-  if (contribMsg) {
-    console.log("[VidKing] Server contributions: " + contribMsg);
-  }
-
-  return allStreams;
-}
-
-/**
- * Extract codec label from #EXT-X-STREAM-INF line for display.
- */
 function extractCodecLabel(streamInfLine) {
-  var m = streamInfLine.match(/CODECS="([^"]+)"/i);
-  if (!m) return "";
-  var codecs = String(m[1]).toLowerCase();
-  if (codecs.indexOf("hev1") !== -1 || codecs.indexOf("hvc1") !== -1)
-    return "HEVC";
-  if (codecs.indexOf("dvh1") !== -1 || codecs.indexOf("dvhe") !== -1)
-    return "DV";
-  if (codecs.indexOf("av01") !== -1 || codecs.indexOf("dav1") !== -1)
-    return "AV1";
-  if (codecs.indexOf("avc1") !== -1) return "H.264";
-  return "";
+	var m = streamInfLine.match(/CODECS="([^"]+)"/i);
+	if (!m) return "";
+	var c = String(m[1]).toLowerCase();
+	if (c.indexOf("hev1") !== -1 || c.indexOf("hvc1") !== -1) return "HEVC";
+	if (c.indexOf("dvh1") !== -1 || c.indexOf("dvhe") !== -1) return "DV";
+	if (c.indexOf("av01") !== -1 || c.indexOf("dav1") !== -1) return "AV1";
+	if (c.indexOf("avc1") !== -1) return "H.264";
+	return "";
 }
 
-/**
- * Fetch an M3U8 playlist, parse it for multi-quality variants,
- * and return expanded stream objects.
- *
- * If the playlist is a master with #EXT-X-STREAM-INF entries, returns
- * one stream per resolution variant plus the master as "Auto".
- * If it's a simple playlist, returns just the original URL.
- *
- * @param {string} playlistUrl - URL of the M3U8 playlist
- * @param {Object} streamHeaders - Headers to include in stream requests
- * @param {number} m3u8FetchTimeout - Timeout for fetching the playlist
- * @returns {Promise<Array>} Array of stream objects { url, quality, headers, subtitles? }
- */
-async function expandM3U8Variants(
-  playlistUrl,
-  streamHeaders,
-  m3u8FetchTimeout,
-) {
-  m3u8FetchTimeout = m3u8FetchTimeout || 10000;
-  var result = [];
+async function expandM3U8Variants(playlistUrl, streamHeaders) {
+	try {
+		var content = await httpGet(playlistUrl, {
+			"User-Agent": UA,
+			Referer: VIDKING_BASE + "/",
+			Accept: "*/*",
+		});
+		if (!content || content.indexOf("#EXTM3U") === -1) return null;
+		if (content.indexOf("#EXT-X-STREAM-INF:") === -1) return null;
 
-  try {
-    var m3u8Content = await withTimeout(
-      httpGet(playlistUrl, {
-        "User-Agent": UA,
-        Referer: VIDKING_BASE + "/",
-        Accept: "*/*",
-      }),
-      m3u8FetchTimeout,
-      "m3u8 fetch",
-    );
+		var lines = content.split("\n");
+		var variants = [];
+		var subtitleTracks = [];
 
-    if (!m3u8Content || m3u8Content.indexOf("#EXTM3U") === -1) {
-      // Not a valid playlist—return the original URL as-is
-      return null;
-    }
+		for (var li = 0; li < lines.length; li++) {
+			var line = lines[li];
+			if (line.indexOf("#EXT-X-STREAM-INF:") !== -1) {
+				var resMatch = line.match(/RESOLUTION=\d+x(\d+)/i);
+				var height = resMatch ? parseInt(resMatch[1], 10) : 0;
+				var codecLabel = extractCodecLabel(line);
+				if (li + 1 < lines.length) {
+					var urlPart = lines[li + 1].trim();
+					if (urlPart && urlPart.indexOf("#") !== 0) {
+						var fullUrl =
+							urlPart.indexOf("http") === 0
+								? urlPart
+								: resolveRelativeUrl(playlistUrl, urlPart);
+						var qualityTag = qualityLabel(height);
+						if (codecLabel) qualityTag += " [" + codecLabel + "]";
+						variants.push({
+							url: fullUrl,
+							quality: qualityTag,
+							height: height,
+						});
+					}
+				}
+			}
+			if (line.indexOf("#EXT-X-MEDIA:TYPE=SUBTITLES") !== -1) {
+				var subUrlMatch = line.match(/URI="([^"]+)"/);
+				var subLangMatch = line.match(/LANGUAGE="([^"]+)"/);
+				var subNameMatch = line.match(/NAME="([^"]+)"/);
+				if (subUrlMatch && subUrlMatch[1]) {
+					var subUrl = subUrlMatch[1];
+					if (subUrl.indexOf("http") !== 0)
+						subUrl = resolveRelativeUrl(playlistUrl, subUrl);
+					subtitleTracks.push({
+						url: subUrl,
+						label: (subNameMatch && subNameMatch[1]) || "Subtitle",
+						lang: (subLangMatch && subLangMatch[1]) || "en",
+					});
+				}
+			}
+		}
 
-    // Check if this is a master playlist with quality variants
-    if (m3u8Content.indexOf("#EXT-X-STREAM-INF:") === -1) {
-      // Simple single-quality playlist—return as-is
-      return null;
-    }
-
-    var lines = m3u8Content.split("\n");
-    var variantEntries = [];
-    var subtitleTracks = [];
-    var audioEntry = null;
-
-    for (var li = 0; li < lines.length; li++) {
-      var line = lines[li];
-
-      // ── Parse variant quality streams ──
-      if (line.indexOf("#EXT-X-STREAM-INF:") !== -1) {
-        var resMatch = line.match(/RESOLUTION=\d+x(\d+)/i);
-        var height = resMatch ? parseInt(resMatch[1], 10) : 0;
-        var codecLabel = extractCodecLabel(line);
-
-        if (li + 1 < lines.length) {
-          var urlPart = lines[li + 1].trim();
-          if (urlPart && urlPart.indexOf("#") !== 0) {
-            var fullUrl =
-              urlPart.indexOf("http") === 0
-                ? urlPart
-                : resolveRelativeUrl(playlistUrl, urlPart);
-
-            var qualityTag =
-              height >= 2160
-                ? "2160p"
-                : height >= 1440
-                  ? "1440p"
-                  : height >= 1080
-                    ? "1080p"
-                    : height >= 720
-                      ? "720p"
-                      : height >= 480
-                        ? "480p"
-                        : height >= 360
-                          ? "360p"
-                          : height
-                            ? height + "p"
-                            : "Auto";
-
-            // Append codec label if notable
-            if (codecLabel) qualityTag += " [" + codecLabel + "]";
-
-            variantEntries.push({
-              url: fullUrl,
-              quality: qualityTag,
-              height: height,
-            });
-          }
-        }
-      }
-
-      // ── Parse subtitle tracks ──
-      if (line.indexOf("#EXT-X-MEDIA:TYPE=SUBTITLES") !== -1) {
-        var subUrlMatch = line.match(/URI="([^"]+)"/);
-        var subLangMatch = line.match(/LANGUAGE="([^"]+)"/);
-        var subNameMatch = line.match(/NAME="([^"]+)"/);
-        if (subUrlMatch && subUrlMatch[1]) {
-          var subUrl = subUrlMatch[1];
-          if (subUrl.indexOf("http") !== 0) {
-            subUrl = resolveRelativeUrl(playlistUrl, subUrl);
-          }
-          subtitleTracks.push({
-            url: subUrl,
-            label: (subNameMatch && subNameMatch[1]) || "Subtitle",
-            lang: (subLangMatch && subLangMatch[1]) || "en",
-          });
-        }
-      }
-
-      // ── Parse audio tracks ──
-      if (line.indexOf("#EXT-X-MEDIA:TYPE=AUDIO") !== -1) {
-        var auUrlMatch = line.match(/URI="([^"]+)"/);
-        var auLangMatch = line.match(/LANGUAGE="([^"]+)"/);
-        var auNameMatch = line.match(/NAME="([^"]+)"/);
-        if (auUrlMatch && auUrlMatch[1]) {
-          var audioUrl = auUrlMatch[1];
-          if (audioUrl.indexOf("http") !== 0) {
-            audioUrl = resolveRelativeUrl(playlistUrl, audioUrl);
-          }
-          audioEntry = {
-            url: audioUrl,
-            label: (auNameMatch && auNameMatch[1]) || "Audio",
-            lang: (auLangMatch && auLangMatch[1]) || "en",
-          };
-        }
-      }
-    }
-
-    // Build the result: one stream per variant + the master playlist
-    if (variantEntries.length > 0) {
-      // Sort by quality descending (highest first)
-      variantEntries.sort(function (a, b) {
-        return b.height - a.height;
-      });
-
-      var ts = Date.now();
-
-      for (var vi = 0; vi < variantEntries.length; vi++) {
-        var ve = variantEntries[vi];
-        var streamObj = {
-          url: ve.url,
-          quality: ve.quality,
-          headers: copyHeaders(streamHeaders),
-        };
-        if (subtitleTracks.length > 0) {
-          streamObj.subtitles = subtitleTracks;
-        }
-        result.push(streamObj);
-      }
-
-      // Also add the master playlist URL as "Auto" quality
-      // (appends a timestamp suffix to differentiate it from variants)
-      var masterEntry = {
-        url: playlistUrl /* + "#master-" + ts */,
-        quality: "Auto",
-        headers: copyHeaders(streamHeaders),
-      };
-      if (subtitleTracks.length > 0) {
-        masterEntry.subtitles = subtitleTracks;
-      }
-      result.push(masterEntry);
-
-      return result;
-    }
-  } catch (e) {
-    // M3U8 fetch/parse failed—caller will fall back to original URL
-    return null;
-  }
-
-  return null;
-}
-
-/**
- * Normalize a quality string to a standard label.
- */
-/**
- * Build streams from the decrypted API result with full M3U8 variant expansion.
- *
- * For each source returned by the API:
- *   - If it's an M3U8 URL, fetch the playlist and expand into all
- *     resolution variants (1080p, 720p, 480p, etc.)
- *   - If it's a direct video URL, return it as a single stream
- *   - Subtitles from the API response are attached to all streams
- *
- * @param {Object} result - Decrypted API response with sources & subtitles
- * @param {Object} params - Content parameters (tmdbId, type, etc.)
- * @returns {Promise<Array>} Array of expanded stream objects
- */
-async function buildStreamsFromResult(result, params) {
-  if (!result) return [];
-
-  var rawSources = result.sources || [];
-  var rawSubtitles = result.subtitles || [];
-  var subs = [];
-
-  // ── Normalize API-level subtitles ──
-  var seenSubs = {};
-  for (var j = 0; j < rawSubtitles.length; j++) {
-    var sub = rawSubtitles[j];
-    if (!sub || !sub.url) continue;
-    if (seenSubs[sub.url]) continue;
-    seenSubs[sub.url] = true;
-    var subLabel = sub.language || sub.lang || sub.label || "Unknown";
-    subs.push({
-      url: sub.url,
-      label: subLabel,
-      lang: sub.language || sub.lang || "",
-    });
-  }
-  if (subs.length > 30) {
-    subs = subs.slice(0, 30);
-  }
-
-  // ── Phase 1: Fire all M3U8 expansions in parallel ──
-  var m3u8ExpansionPromises = [];
-  var playlistSources = [];
-
-  for (var i = 0; i < rawSources.length; i++) {
-    var s = rawSources[i];
-    if (!s || !s.url) continue;
-    if (!isValidStreamUrl(s.url)) continue;
-
-    if (
-      s.url.indexOf(".m3u8") !== -1 ||
-      s.url.indexOf(".m3u") !== -1 ||
-      s.url.indexOf("playlist") !== -1 ||
-      s.url.indexOf("m3u8") !== -1
-    ) {
-      playlistSources.push(s);
-    }
-  }
-
-  for (var pi = 0; pi < playlistSources.length; pi++) {
-    var ps = playlistSources[pi];
-    var streamHeaders = {
-      "User-Agent": UA,
-      Referer: VIDKING_BASE + "/",
-      Origin: VIDKING_BASE,
-      Accept: "*/*",
-    };
-    m3u8ExpansionPromises.push(
-      expandM3U8Variants(ps.url, streamHeaders, 10000),
-    );
-  }
-
-  var expansionResults = [];
-  if (m3u8ExpansionPromises.length > 0) {
-    expansionResults = await Promise.all(m3u8ExpansionPromises);
-  }
-
-  // ── Phase 2: Merge results with dedup ──
-  var allStreams = [];
-  var seenUrls = {};
-
-  for (var ri = 0; ri < expansionResults.length; ri++) {
-    var expanded = expansionResults[ri];
-    if (!expanded || expanded.length === 0) {
-      // M3U8 expansion failed — fall back to the original playlist URL
-      var fallbackSrc = playlistSources[ri];
-      var fallbackUrl = fallbackSrc && fallbackSrc.url;
-      if (fallbackUrl && !seenUrls[fallbackUrl]) {
-        seenUrls[fallbackUrl] = true;
-        var streamHeaders = {
-          "User-Agent": UA,
-          Referer: VIDKING_BASE + "/",
-          Origin: VIDKING_BASE,
-          Accept: "*/*",
-        };
-        // Preserve API-provided quality when M3U8 expansion fails
-        var fbQuality =
-          fallbackSrc && fallbackSrc.quality
-            ? normalizeQuality(fallbackSrc.quality)
-            : extractQuality(fallbackUrl) || "Auto";
-        allStreams.push({
-          url: fallbackUrl,
-          quality: fbQuality,
-          headers: streamHeaders,
-          subtitles: subs.length > 0 ? subs : undefined,
-        });
-      }
-      continue;
-    }
-
-    for (var ei = 0; ei < expanded.length; ei++) {
-      var exp = expanded[ei];
-      if (seenUrls[exp.url]) continue;
-      seenUrls[exp.url] = true;
-
-      // Attach API subtitles if M3U8 doesn't have its own
-      if (!exp.subtitles || exp.subtitles.length === 0) {
-        if (subs.length > 0) {
-          exp.subtitles = subs;
-        }
-      }
-
-      allStreams.push(exp);
-    }
-  }
-
-  // ── Phase 3: Non-playlist sources (direct URLs) ──
-  for (var di = 0; di < rawSources.length; di++) {
-    var ds = rawSources[di];
-    if (!ds || !ds.url) continue;
-    if (!isValidStreamUrl(ds.url)) continue;
-
-    if (
-      ds.url.indexOf(".m3u8") !== -1 ||
-      ds.url.indexOf(".m3u") !== -1 ||
-      ds.url.indexOf("playlist") !== -1 ||
-      ds.url.indexOf("m3u8") !== -1
-    ) {
-      continue; // Already handled in Phase 1/2
-    }
-
-    if (seenUrls[ds.url]) continue;
-    seenUrls[ds.url] = true;
-
-    var quality = ds.quality
-      ? normalizeQuality(ds.quality)
-      : extractQuality(ds.url) || "Auto";
-
-    var streamObj = {
-      url: ds.url,
-      quality: quality,
-      headers: {
-        "User-Agent": UA,
-        Referer: VIDKING_BASE + "/",
-        Origin: VIDKING_BASE,
-        Accept: "*/*",
-      },
-    };
-
-    if (subs.length > 0) {
-      streamObj.subtitles = subs;
-    }
-
-    allStreams.push(streamObj);
-  }
-
-  return allStreams;
+		if (variants.length === 0) return null;
+		variants.sort(function (a, b) {
+			return b.height - a.height;
+		});
+		var result = [];
+		for (var vi = 0; vi < variants.length; vi++) {
+			var ve = variants[vi];
+			var streamObj = {
+				url: ve.url,
+				quality: ve.quality,
+				headers: copyHeaders(streamHeaders),
+			};
+			if (subtitleTracks.length > 0) streamObj.subtitles = subtitleTracks;
+			result.push(streamObj);
+		}
+		// Add master as Auto
+		var masterObj = {
+			url: playlistUrl,
+			quality: "Auto",
+			headers: copyHeaders(streamHeaders),
+		};
+		if (subtitleTracks.length > 0) masterObj.subtitles = subtitleTracks;
+		result.push(masterObj);
+		return result;
+	} catch (e) {
+		return null;
+	}
 }
 
 function normalizeQuality(q) {
-  if (!q) return "";
-  var qs = String(q).toLowerCase().trim();
-  if (qs === "4k" || qs === "2160" || qs === "2160p") return "2160p";
-  if (qs === "2k" || qs === "1440" || qs === "1440p" || qs === "qhd")
-    return "1440p";
-  if (qs === "hd" || qs === "1080" || qs === "1080p") return "1080p";
-  if (qs === "hq" || qs === "720" || qs === "720p") return "720p";
-  if (qs === "sd" || qs === "480" || qs === "480p") return "480p";
-  if (qs === "360" || qs === "360p") return "360p";
-  if (qs === "240" || qs === "240p") return "240p";
-  return q;
+	if (!q) return "";
+	var qs = String(q).toLowerCase().trim();
+	if (qs === "4k" || qs === "2160" || qs === "2160p") return "2160p";
+	if (qs === "2k" || qs === "1440" || qs === "1440p" || qs === "qhd")
+		return "1440p";
+	if (qs === "hd" || qs === "1080" || qs === "1080p") return "1080p";
+	if (qs === "hq" || qs === "720" || qs === "720p") return "720p";
+	if (qs === "sd" || qs === "480" || qs === "480p") return "480p";
+	if (qs === "360" || qs === "360p") return "360p";
+	if (qs === "240" || qs === "240p") return "240p";
+	return q;
 }
 
-/**
- * Try to extract direct M3U8 URLs from VidKing embed page HTML.
- * This is a secondary extraction method that works when the
- * API route fails.
- */
-async function extractFromEmbedPage(tmdbId, type, season, episode) {
-  try {
-    var embedUrl = embedPageUrl(tmdbId, type, season, episode);
+// ─── Single Server API Call ───
 
-    var html = await withTimeout(
-      httpGet(embedUrl, {
-        "User-Agent": UA,
-        Accept: "text/html,application/xhtml+xml",
-        Referer: VIDKING_BASE + "/",
-      }),
-      REQUEST_TIMEOUT,
-      "embed page",
-    );
-
-    if (!html || html.length < 100) return null;
-
-    // Look for M3U8 URLs in the page HTML
-    var m3u8Urls = [];
-    var m3u8Regex = /https?:\/\/[^"'\s<>]+\.m3u8[^"'\s<>]*/gi;
-    var match;
-    while ((match = m3u8Regex.exec(html)) !== null) {
-      var url = match[0];
-      // Filter out garbage URLs
-      if (url.length > 20 && url.indexOf(".m3u8") !== -1) {
-        m3u8Urls.push(url);
-      }
-    }
-
-    if (m3u8Urls.length > 0) {
-      var streams = [];
-      var embedHeaders = {
-        "User-Agent": UA,
-        Referer: VIDKING_BASE + "/",
-        Origin: VIDKING_BASE,
-      };
-
-      // Try to expand each M3U8 URL into quality variants
-      for (var i = 0; i < m3u8Urls.length; i++) {
-        var expanded = await expandM3U8Variants(
-          m3u8Urls[i],
-          embedHeaders,
-          8000,
-        );
-        if (expanded && expanded.length > 0) {
-          for (var ei = 0; ei < expanded.length; ei++) {
-            streams.push(expanded[ei]);
-          }
-        } else {
-          streams.push({
-            url: m3u8Urls[i],
-            quality: extractQuality(m3u8Urls[i]) || "Auto",
-            headers: embedHeaders,
-          });
-        }
-      }
-
-      return {
-        source: SOURCE_NAME,
-        status: "working",
-        streams: streams,
-        latency_ms: 0, // will be set by caller
-      };
-    }
-  } catch (e) {
-    return null;
-  }
-  return null;
+function buildApiUrl(serverEndpoint, params) {
+	var url = VIDEO_API_BASE + "/" + serverEndpoint + "?";
+	url += "title=" + encodeURIComponent(params.title || "");
+	url += "&mediaType=" + encodeURIComponent(params.type);
+	url += "&year=" + encodeURIComponent(params.year || "");
+	url += "&tmdbId=" + encodeURIComponent(String(params.tmdbId));
+	url += "&imdbId=" + encodeURIComponent(params.imdbId || "");
+	url += "&seasonId=" + encodeURIComponent(String(params.season || 1));
+	url += "&episodeId=" + encodeURIComponent(String(params.episode || 1));
+	url += "&_t=" + Date.now();
+	return url;
 }
 
-/**
- * Build an embed page URL for the VidKing player.
- */
-function embedPageUrl(tmdbId, type, season, episode) {
-  return type === "tv"
-    ? VIDKING_BASE +
-        "/embed/tv/" +
-        String(tmdbId) +
-        "/" +
-        (season || 1) +
-        "/" +
-        (episode || 1)
-    : VIDKING_BASE + "/embed/movie/" + String(tmdbId);
+async function tryOneServer(server, params) {
+	var apiUrl = buildApiUrl(server.endpoint, params);
+	try {
+		var resp = await httpGet(apiUrl, {
+			"User-Agent": UA,
+			"Cache-Control": "no-cache",
+			Pragma: "no-cache",
+			Origin: VIDKING_BASE,
+			Referer: VIDKING_BASE + "/",
+		});
+		if (!resp || resp.length < 10) return null;
+		return { name: server.name, text: resp };
+	} catch (e) {
+		return null;
+	}
 }
 
-/**
- * Shared embed-fallback helper: tries extractFromEmbedPage only.
- * DOES NOT return the raw embed URL — that's an HTML page, not a
- * playable video stream. If extraction fails, returns null.
- *
- * @returns {Object|null} A source result object with M3U8 streams, or null.
- */
-async function tryEmbedFallback(tmdbId, type, season, episode, start) {
-  var embedResult = await extractFromEmbedPage(tmdbId, type, season, episode);
-  if (embedResult) {
-    embedResult.latency_ms = Date.now() - start;
-    console.log(
-      "[VidKing] ✓ embed extraction: " +
-        embedResult.streams.length +
-        " streams (" +
-        embedResult.latency_ms +
-        "ms)",
-    );
-    return embedResult;
-  }
-  console.log("[VidKing] ✗ embed extraction: no M3U8 streams found");
-  return null;
+async function tryAllServersInParallel(params) {
+	var promises = [];
+	for (var si = 0; si < SERVERS.length; si++) {
+		if (!SERVERS[si].isActive) continue;
+		promises.push(tryOneServer(SERVERS[si], params));
+	}
+	if (promises.length === 0) return [];
+
+	// Wait for ALL to settle, collect first 2 valid results
+	var results = await Promise.all(
+		promises.map(function (p) {
+			return p
+				.then(function (v) {
+					return v;
+				})
+				.catch(function () {
+					return null;
+				});
+		}),
+	);
+
+	var valid = [];
+	for (var ri = 0; ri < results.length; ri++) {
+		if (results[ri] && results[ri].text && results[ri].text.length >= 10) {
+			valid.push(results[ri]);
+			if (valid.length >= 2) break;
+		}
+	}
+	return valid;
 }
 
-// ─── Main Scrape Function ───────────────────────────────────────────────────
+// ─── Decryption ───
 
-var TOTAL_SCRAPE_TIMEOUT = 30000;
-
-/**
- * Scrape streams from vidking.net for the given content.
- *
- * Architecture (parallel):
- *   1. Launch embed page extraction IMMEDIATELY (fast, http_get only)
- *   2. Simultaneously fetch TMDB metadata, then fire ALL 4 API servers
- *      in parallel, decrypt responses in parallel, merge streams
- *   3. Race both approaches — first one with usable streams wins
- *   4. Never return raw embed URLs (HTML pages are not playable video)
- *   5. Hard cap at TOTAL_SCRAPE_TIMEOUT to prevent blocking the UI
- *
- * @param {Object} params - The parameters object
- * @param {number} params.tmdbId - TMDB ID of the content
- * @param {string} params.type - "movie" or "tv"
- * @param {number} [params.season] - Season number (for TV)
- * @param {number} [params.episode] - Episode number (for TV)
- * @returns {Object} Source result with streams
- */
-async function scrapeStreams(params) {
-  var start = Date.now();
-  if (!params || typeof params !== "object") {
-    return makeFail(SOURCE_NAME, "invalid parameters: expected object", start);
-  }
-  var tmdbId = params.tmdbId;
-  var type = params.type || "movie";
-  var season = params.season || 1;
-  var episode = params.episode || 1;
-
-  if (!tmdbId) {
-    return makeFail(SOURCE_NAME, "no tmdbId provided", start);
-  }
-
-  // ── Hard timeout guard ──
-  try {
-    return await withTimeout(
-      scrapeStreamsInner(tmdbId, type, season, episode, start),
-      TOTAL_SCRAPE_TIMEOUT,
-      "total scrape",
-    );
-  } catch (e) {
-    console.log(
-      "[VidKing] Total timeout (" +
-        TOTAL_SCRAPE_TIMEOUT +
-        "ms), returning no_streams: " +
-        (e && e.message),
-    );
-    return makeFail(SOURCE_NAME, "total timeout", start);
-  }
+async function decryptOne(encryptedText, tmdbId, serverName) {
+	if (!encryptedText || encryptedText.length < 10) return null;
+	try {
+		var raw = await httpPost(
+			DECRYPT_API,
+			{ "Content-Type": "application/json", "User-Agent": UA },
+			JSON.stringify({ text: encryptedText, id: String(tmdbId) }),
+		);
+		var data = safeJsonParse(raw);
+		if (!data || data.status !== 200 || !data.result) return null;
+		return { name: serverName, result: data.result };
+	} catch (e) {
+		return null;
+	}
 }
 
-/**
- * Inner scrape logic — two approaches race in parallel.
- *
- * Approach A: Embed page extraction (fast, 2-8s, only needs http_get)
- * Approach B: API pipeline (slow, 12-25s, needs TMDB + http_post for decrypt)
- */
+async function decryptAllInParallel(serverResponses, tmdbId) {
+	if (!serverResponses || serverResponses.length === 0) return [];
+	var promises = [];
+	for (var i = 0; i < serverResponses.length; i++) {
+		promises.push(
+			decryptOne(serverResponses[i].text, tmdbId, serverResponses[i].name),
+		);
+	}
+	var results = await Promise.all(
+		promises.map(function (p) {
+			return p
+				.then(function (v) {
+					return v;
+				})
+				.catch(function () {
+					return null;
+				});
+		}),
+	);
+	var valid = [];
+	for (var ri = 0; ri < results.length; ri++) {
+		if (results[ri] && results[ri].result) {
+			valid.push(results[ri]);
+		}
+	}
+	return valid;
+}
+
+// ─── Build Streams From Decrypted Result ───
+
+async function buildStreamsFromResult(result) {
+	if (!result) return [];
+	var rawSources = result.sources || [];
+	var rawSubtitles = result.subtitles || [];
+	var subs = [];
+	var seenSubs = {};
+	for (var j = 0; j < rawSubtitles.length; j++) {
+		var sub = rawSubtitles[j];
+		if (!sub || !sub.url || seenSubs[sub.url]) continue;
+		seenSubs[sub.url] = true;
+		subs.push({
+			url: sub.url,
+			label: sub.language || sub.lang || sub.label || "Unknown",
+			lang: sub.language || sub.lang || "",
+		});
+	}
+	if (subs.length > 30) subs = subs.slice(0, 30);
+
+	// Expand M3U8 playlists in parallel
+	var expandPromises = [];
+	var playlistSources = [];
+	var directSources = [];
+
+	for (var i = 0; i < rawSources.length; i++) {
+		var s = rawSources[i];
+		if (!s || !s.url) continue;
+		if (s.url.indexOf(".m3u8") !== -1 || s.url.indexOf("playlist") !== -1) {
+			playlistSources.push(s);
+		} else {
+			directSources.push(s);
+		}
+	}
+
+	for (var pi = 0; pi < playlistSources.length; pi++) {
+		var ps = playlistSources[pi];
+		var hdrs = {
+			"User-Agent": UA,
+			Referer: VIDKING_BASE + "/",
+			Origin: VIDKING_BASE,
+			Accept: "*/*",
+		};
+		expandPromises.push(expandM3U8Variants(ps.url, hdrs));
+	}
+
+	var expansionResults = [];
+	if (expandPromises.length > 0) {
+		expansionResults = await Promise.all(
+			expandPromises.map(function (p) {
+				return p
+					.then(function (v) {
+						return v;
+					})
+					.catch(function () {
+						return null;
+					});
+			}),
+		);
+	}
+
+	var allStreams = [];
+	var seenUrls = {};
+
+	// Add expanded M3U8 results
+	for (var ri = 0; ri < expansionResults.length; ri++) {
+		var expanded = expansionResults[ri];
+		var origSrc = playlistSources[ri];
+		if (!expanded || expanded.length === 0) {
+			// Fallback: original playlist URL
+			if (origSrc && origSrc.url && !seenUrls[origSrc.url]) {
+				seenUrls[origSrc.url] = true;
+				var fbQuality =
+					normalizeQuality(origSrc.quality) ||
+					extractQuality(origSrc.url) ||
+					"Auto";
+				allStreams.push({
+					url: origSrc.url,
+					quality: fbQuality,
+					headers: {
+						"User-Agent": UA,
+						Referer: VIDKING_BASE + "/",
+						Origin: VIDKING_BASE,
+						Accept: "*/*",
+					},
+					subtitles: subs.length > 0 ? subs : undefined,
+				});
+			}
+			continue;
+		}
+		for (var ei = 0; ei < expanded.length; ei++) {
+			var exp = expanded[ei];
+			if (seenUrls[exp.url]) continue;
+			seenUrls[exp.url] = true;
+			if (!exp.subtitles || exp.subtitles.length === 0) {
+				if (subs.length > 0) exp.subtitles = subs;
+			}
+			allStreams.push(exp);
+		}
+	}
+
+	// Add direct sources
+	for (var di = 0; di < directSources.length; di++) {
+		var ds = directSources[di];
+		if (!ds || !ds.url || seenUrls[ds.url]) continue;
+		seenUrls[ds.url] = true;
+		var quality =
+			normalizeQuality(ds.quality) || extractQuality(ds.url) || "Auto";
+		var streamObj = {
+			url: ds.url,
+			quality: quality,
+			headers: {
+				"User-Agent": UA,
+				Referer: VIDKING_BASE + "/",
+				Origin: VIDKING_BASE,
+				Accept: "*/*",
+			},
+		};
+		if (subs.length > 0) streamObj.subtitles = subs;
+		allStreams.push(streamObj);
+	}
+
+	return allStreams;
+}
+
+async function mergeServerResults(decryptedResults) {
+	if (!decryptedResults || decryptedResults.length === 0) return [];
+
+	// Merge streams from each server with dedup
+	var allStreams = [];
+	var seenUrls = {};
+
+	for (var ri = 0; ri < decryptedResults.length; ri++) {
+		var dr = decryptedResults[ri];
+		if (!dr || !dr.result) continue;
+		var streams = await buildStreamsFromResult(dr.result);
+		for (var si = 0; si < streams.length; si++) {
+			var stream = streams[si];
+			if (seenUrls[stream.url]) continue;
+			seenUrls[stream.url] = true;
+			allStreams.push(stream);
+		}
+	}
+
+	return allStreams;
+}
+
+// ─── Embed Page Extraction ───
+
+async function extractM3U8FromEmbedPage(tmdbId, type, season, episode) {
+	try {
+		var embedUrl =
+			type === "tv"
+				? VIDKING_BASE +
+					"/embed/tv/" +
+					tmdbId +
+					"/" +
+					(season || 1) +
+					"/" +
+					(episode || 1)
+				: VIDKING_BASE + "/embed/movie/" + tmdbId;
+
+		var html = await httpGet(embedUrl, {
+			"User-Agent": UA,
+			Accept: "text/html,application/xhtml+xml",
+			Referer: VIDKING_BASE + "/",
+		});
+
+		if (!html || html.length < 100) return null;
+
+		// Search for M3U8 in HTML
+		var m3u8Regex = /https?:\/\/[^"'\s<>]+\.m3u8[^"'\s<>]*/gi;
+		var match;
+		var m3u8Urls = [];
+		while ((match = m3u8Regex.exec(html)) !== null) {
+			var url = match[0].trim();
+			if (url.length > 20 && m3u8Urls.indexOf(url) === -1) {
+				m3u8Urls.push(url);
+			}
+		}
+
+		if (m3u8Urls.length === 0) return null;
+
+		var streams = [];
+		var seen = {};
+		for (var i = 0; i < m3u8Urls.length; i++) {
+			var mu = m3u8Urls[i];
+			if (seen[mu]) continue;
+			seen[mu] = true;
+			var expanded = await expandM3U8Variants(mu, {
+				"User-Agent": UA,
+				Referer: VIDKING_BASE + "/",
+				Origin: VIDKING_BASE,
+			});
+			if (expanded && expanded.length > 0) {
+				for (var ei = 0; ei < expanded.length; ei++) {
+					streams.push(expanded[ei]);
+				}
+			} else {
+				streams.push({
+					url: mu,
+					quality: extractQuality(mu) || "Auto",
+					headers: {
+						"User-Agent": UA,
+						Referer: VIDKING_BASE + "/",
+						Origin: VIDKING_BASE,
+					},
+				});
+			}
+		}
+
+		return streams.length > 0 ? streams : null;
+	} catch (e) {
+		return null;
+	}
+}
+
+// ─── Main Scrape ───
+
 async function scrapeStreamsInner(tmdbId, type, season, episode, start) {
-  // Log content being resolved
-  console.log(
-    "[VidKing] Resolving tmdb:" +
-      tmdbId +
-      " " +
-      type +
-      (type === "tv" ? " S" + season + "E" + episode : "") +
-      "...",
-  );
+	// Approach A: Embed page extraction (starts immediately)
+	var embedPromise = extractM3U8FromEmbedPage(tmdbId, type, season, episode);
 
-  // ── Approach A: Embed page extraction (starts immediately) ──
-  var embedPromise = tryEmbedFallback(tmdbId, type, season, episode, start);
+	// Approach B: Full API pipeline (needs TMDB metadata)
+	var apiPromise = (async function () {
+		try {
+			var meta = await fetchTmdbMeta(tmdbId, type);
+			var apiParams = {
+				title: (meta && meta.title) || "",
+				type: type,
+				year: (meta && meta.year) || "",
+				tmdbId: tmdbId,
+				imdbId: (meta && meta.imdb_id) || "",
+				season: season || 1,
+				episode: episode || 1,
+			};
 
-  // ── Approach B: Full API pipeline ──
-  var apiPromise = (async function () {
-    try {
-      // TMDB metadata is optional — if it fails, we still try the API
-      // with just the tmdbId (the API might resolve title/year internally)
-      var meta = await fetchTmdbMeta(tmdbId, type);
+			var serverResponses = await tryAllServersInParallel(apiParams);
+			if (serverResponses.length === 0) return null;
 
-      if (meta && meta.title) {
-        console.log(
-          "[VidKing] " +
-            meta.title +
-            " (" +
-            (meta.year || "N/A") +
-            ") imdb:" +
-            (meta.imdb_id || "N/A") +
-            " tmdb:" +
-            tmdbId +
-            (type === "tv" ? " S" + season + "E" + episode : ""),
-        );
-      } else {
-        console.log("[VidKing] TMDB metadata unavailable, using tmdbId only");
-      }
+			var decryptedResults = await decryptAllInParallel(
+				serverResponses,
+				tmdbId,
+			);
+			if (decryptedResults.length === 0) return null;
 
-      var apiParams = {
-        title: (meta && meta.title) || "",
-        type: type,
-        year: (meta && meta.year) || "",
-        tmdbId: tmdbId,
-        imdbId: (meta && meta.imdb_id) || "",
-        season: season,
-        episode: episode,
-      };
+			var streams = await mergeServerResults(decryptedResults);
+			if (streams.length === 0) return null;
 
-      var serverResponses = await tryAllServers(apiParams);
-      if (serverResponses.length === 0) return null;
+			return {
+				source: SOURCE_NAME,
+				status: "working",
+				streams: streams,
+				latency_ms: Date.now() - start,
+			};
+		} catch (e) {
+			return null;
+		}
+	})();
 
-      var decryptedResults = await decryptAllResponses(serverResponses, tmdbId);
-      if (decryptedResults.length === 0) return null;
+	// Race both approaches
+	var embedResult = await embedPromise;
+	if (embedResult && embedResult.length > 0) {
+		return {
+			source: SOURCE_NAME,
+			status: "working",
+			streams: embedResult,
+			latency_ms: Date.now() - start,
+		};
+	}
 
-      var streams = await mergeServerResults(decryptedResults);
-      if (streams.length === 0) return null;
+	// Embed failed, try API
+	var apiResult = await apiPromise;
+	if (apiResult && apiResult.streams && apiResult.streams.length > 0) {
+		return apiResult;
+	}
 
-      streams.sort(function (a, b) {
-        return qualityRank(b.quality) - qualityRank(a.quality);
-      });
-
-      return {
-        source: SOURCE_NAME,
-        status: "working",
-        streams: streams,
-        latency_ms: Date.now() - start,
-      };
-    } catch (e) {
-      console.log("[VidKing] API approach failed: " + (e && e.message));
-      return null;
-    }
-  })();
-
-  // ── Race both approaches ──
-  // Wrap each in a tagged promise so we know which finished first
-  var embedTagged = embedPromise.then(function (r) {
-    return { tag: "embed", result: r };
-  });
-  var apiTagged = apiPromise.then(function (r) {
-    return { tag: "api", result: r };
-  });
-
-  var first = await Promise.race([embedTagged, apiTagged]);
-
-  if (first.result && first.result.streams && first.result.streams.length > 0) {
-    // Ensure latency_ms is accurate
-    first.result.latency_ms = Date.now() - start;
-    return first.result;
-  }
-
-  // First approach had no streams — wait for the other
-  var second = first.tag === "embed" ? await apiPromise : await embedPromise;
-
-  if (second && second.streams && second.streams.length > 0) {
-    second.latency_ms = Date.now() - start;
-    return second;
-  }
-
-  // Both failed — declare defeat
-  return makeFail(
-    SOURCE_NAME,
-    "all approaches failed (" + (Date.now() - start) + "ms)",
-    start,
-  );
+	return null;
 }
 
-// ─── Module Exports ─────────────────────────────────────────────────────────
+async function scrapeStreams(params) {
+	var start = Date.now();
+	if (!params || !params.tmdbId) {
+		return makeFail(SOURCE_NAME, "no tmdbId provided", start);
+	}
+	var tmdbId = params.tmdbId;
+	var type = params.type || "movie";
+	var season = params.season || 1;
+	var episode = params.episode || 1;
 
-module.exports = {
-  name: SOURCE_NAME,
-  scrapeStreams: scrapeStreams,
-};
+	try {
+		var result = await Promise.race([
+			new Promise(function (_, reject) {
+				setTimeout(function () {
+					reject(new Error("total timeout"));
+				}, TOTAL_TIMEOUT);
+			}),
+			scrapeStreamsInner(tmdbId, type, season, episode, start),
+		]);
+
+		if (result && result.streams && result.streams.length > 0) {
+			result.latency_ms = Date.now() - start;
+			return result;
+		}
+
+		return {
+			source: SOURCE_NAME,
+			status: "no_streams",
+			error: "all approaches failed (" + (Date.now() - start) + "ms)",
+			streams: [],
+			latency_ms: Date.now() - start,
+		};
+	} catch (e) {
+		return {
+			source: SOURCE_NAME,
+			status: "no_streams",
+			error: "timeout (" + (Date.now() - start) + "ms)",
+			streams: [],
+			latency_ms: Date.now() - start,
+		};
+	}
+}
+
+module.exports = { name: SOURCE_NAME, scrapeStreams: scrapeStreams };
