@@ -7,7 +7,9 @@
 	 *   - Dynamic category discovery via /api/sports
 	 *   - Each sport's popular matches loaded on home
 	 *   - Real-time domain resolution from strmd.link with fallback
-	 *   - Embed URLs resolved via loadExtractor() for playable streams
+	 *   - Multi-level embed resolution for playable streams:
+	 *     · Admin source: embed.st directly serves Clappr + JW Player (loadExtractor or raw fallback)
+	 *     · Golf/Echo/Delta source: embed.st → embedhd.org → exposestrat.com/maestrohd1.php → .m3u8
 	 *
 	 * @see https://streamed.pk/docs
 	 * @see https://strmd.link
@@ -76,7 +78,7 @@
 	 * @returns {string}
 	 */
 	function str(value, fallback) {
-		const s = String(value || "").trim();
+		var s = String(value || "").trim();
 		return s || fallback || "";
 	}
 
@@ -101,14 +103,14 @@
 	 * @returns {string|null}
 	 */
 	function normalizeUrl(url) {
-		const s = str(url);
+		var s = str(url);
 		if (!s || !/^https?:\/\//i.test(s)) return null;
 		return s.replace(/\/+$/, "");
 	}
 
 	/**
 	 * Construct a poster URL from match data.
-	 * Priority: match.poster proxy → team badges composite → empty.
+	 * Priority: match.poster proxy → team badges composite → category default → empty.
 	 * @param {object} match
 	 * @param {string} baseUrl
 	 * @returns {string}
@@ -116,19 +118,28 @@
 	function buildPosterUrl(match, baseUrl) {
 		if (!match) return "";
 
-		// If the match has a poster proxy path, use it.
-		const poster = str(match.poster);
+		// Priority 1: If match has a poster proxy path, use it.
+		var poster = str(match.poster);
 		if (poster) {
 			if (poster.startsWith("http")) return poster;
 			return baseUrl + poster;
 		}
 
-		// Fall back to the home team badge if available.
-		const homeBadge =
+		// Priority 2: Home team badge fallback.
+		var homeBadge =
 			match.teams && match.teams.home && str(match.teams.home.badge);
 		if (homeBadge) {
 			return (
 				baseUrl + "/api/images/badge/" + encodeURIComponent(homeBadge) + ".webp"
+			);
+		}
+
+		// Priority 3: Away team badge fallback.
+		var awayBadge =
+			match.teams && match.teams.away && str(match.teams.away.badge);
+		if (awayBadge) {
+			return (
+				baseUrl + "/api/images/badge/" + encodeURIComponent(awayBadge) + ".webp"
 			);
 		}
 
@@ -146,7 +157,8 @@
 	}
 
 	/**
-	 * Determine if a date (unix ms) is in the past.
+	 * Determine if a unix-ms date is a real timestamp (not 0 or special value)
+	 * that represents a past event.
 	 * @param {number} date
 	 * @returns {boolean}
 	 */
@@ -157,7 +169,12 @@
 	}
 
 	/**
-	 * Sort matches: live/upcoming first (by date ascending), then ended.
+	 * Sort matches: 24/7 channels (date=0) and live matches first,
+	 * then upcoming (by date ascending), then ended.
+	 *
+	 * 24/7 channels have date=0 — they are always "live".
+	 * Real timestamps are in the billions (unix ms).
+	 *
 	 * @param {Array} matches
 	 * @returns {Array}
 	 */
@@ -166,9 +183,21 @@
 		return matches.slice().sort(function (a, b) {
 			var aDate = typeof a.date === "number" ? a.date : 0;
 			var bDate = typeof b.date === "number" ? b.date : 0;
+
+			// date=0 means 24/7 channel — always live, sort first within live group
+			var a247 = aDate === 0 ? 1 : 0;
+			var b247 = bDate === 0 ? 1 : 0;
+
+			// Expired = real timestamp in the past
 			var aEnded = aDate > 1000000000000 && aDate < Date.now() ? 1 : 0;
 			var bEnded = bDate > 1000000000000 && bDate < Date.now() ? 1 : 0;
+
+			// Ended matches go last
 			if (aEnded !== bEnded) return aEnded - bEnded;
+
+			// Within non-ended: 24/7 channels first (date=0), then by date ascending
+			if (a247 !== b247) return b247 - a247;
+
 			return aDate - bDate;
 		});
 	}
@@ -189,15 +218,12 @@
 			if (!body) return [];
 
 			var domains = [];
-			// The page contains lines like "streamed.pk" or "streamed.pk - Online"
 			var lines = body.split(/\r?\n/);
 			for (var i = 0; i < lines.length; i++) {
 				var line = lines[i].trim();
 				if (!line) continue;
 
-				// Extract the domain part (before " - " if present)
 				var domain = line.split(" - ")[0].trim();
-				// Filter to likely streamed domains
 				if (/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z]{2,})+$/i.test(domain)) {
 					var url = "https://" + domain;
 					if (domains.indexOf(url) === -1) {
@@ -221,24 +247,20 @@
 	 * @returns {Promise<string>}
 	 */
 	async function getBaseUrl() {
-		// Fast path: already resolved
 		if (_activeBaseUrl) return _activeBaseUrl;
 
 		var candidates = [];
 
-		// Add manifest.baseUrl first
 		var fromManifest = normalizeUrl(
 			typeof manifest !== "undefined" && manifest.baseUrl,
 		);
 		if (fromManifest) candidates.push(fromManifest);
 
-		// Add hardcoded fallback domains
 		for (var f = 0; f < FALLBACK_DOMAINS.length; f++) {
 			var fd = FALLBACK_DOMAINS[f];
 			if (candidates.indexOf(fd) === -1) candidates.push(fd);
 		}
 
-		// Fire-and-forget strmd.link fetch (will cache for next call)
 		var now = Date.now();
 		if (!_cachedDomains || now - _domainLastFetch > DOMAIN_CACHE_TTL) {
 			fetchDomainsFromStrmd()
@@ -251,7 +273,6 @@
 				.catch(function () {});
 		}
 
-		// Try each candidate URL — first one that responds wins
 		for (var i = 0; i < candidates.length; i++) {
 			var url = candidates[i];
 			try {
@@ -268,12 +289,9 @@
 						return url;
 					}
 				}
-			} catch (_) {
-				// Try next candidate
-			}
+			} catch (_) {}
 		}
 
-		// Absolute fallback — don't probe, just use the first hardcoded domain
 		_activeBaseUrl = FALLBACK_DOMAINS[0];
 		return _activeBaseUrl;
 	}
@@ -285,23 +303,19 @@
 	/**
 	 * Extract body text from an HTTP response regardless of runtime format.
 	 * @param {*} resp - http_get response
-	 * @returns {string}
+	 * @returns {string|object}
 	 */
 	function extractBody(resp) {
 		if (!resp) return "";
 
-		// String response
 		if (typeof resp === "string") return resp;
 
-		// Response object with body property
 		if (typeof resp.body !== "undefined") {
 			var b = resp.body;
-			// Body might already be an object (auto-parsed JSON)
 			if (typeof b === "object" && b !== null) return b;
 			return String(b);
 		}
 
-		// Response object with text/data property
 		if (typeof resp.text !== "undefined") return String(resp.text);
 		if (typeof resp.data !== "undefined") {
 			var d = resp.data;
@@ -326,7 +340,6 @@
 			var resp = await http_get(url, headers || REQ_HEADERS);
 			var body = extractBody(resp);
 			if (!body) return null;
-			// If body is already an object/array (runtime auto-parsed JSON), return directly
 			if (typeof body === "object") return body;
 			return tryParse(body);
 		} catch (e) {
@@ -334,6 +347,22 @@
 				"[Streamed] API fetch failed: " + url + " — " + (e.message || e),
 			);
 			return null;
+		}
+	}
+
+	/**
+	 * Fetch HTML page content as text.
+	 * @param {string} url
+	 * @param {object} [headers]
+	 * @returns {Promise<string>}
+	 */
+	async function fetchHtml(url, headers) {
+		try {
+			var resp = await http_get(url, headers || REQ_HEADERS);
+			var body = extractBody(resp);
+			return typeof body === "string" ? body : "";
+		} catch (_) {
+			return "";
 		}
 	}
 
@@ -350,7 +379,6 @@
 			return data;
 		}
 
-		// Fallback: return a minimal sport list based on what the API normally provides
 		var fallback = [
 			{ id: "football", name: "Football" },
 			{ id: "basketball", name: "Basketball" },
@@ -395,7 +423,6 @@
 	function encodeMatchPayload(match) {
 		if (!match) return "";
 
-		// Only store what load/loadStreams needs: minimal, serializable
 		var payload = {
 			kind: "match",
 			matchId: str(match.id),
@@ -484,10 +511,8 @@
 					: "";
 
 			if (providerId) {
-				// Sub-provider mode: only the specific sport
 				sportIds.push(providerId);
 			} else {
-				// Root mode: all sports from /api/sports
 				var sports = await fetchSports();
 				for (var i = 0; i < sports.length; i++) {
 					sportIds.push(sports[i].id);
@@ -510,7 +535,6 @@
 				})();
 			});
 
-			// Wait for all sport fetches to complete concurrently
 			await Promise.all(fetchTasks);
 
 			// Build category → matches mapping using sport names
@@ -573,7 +597,6 @@
 			var baseUrl = await getBaseUrl();
 			var allMatches = await fetchMatches("all");
 
-			// If /api/matches/all returned nothing, try fetching from each sport
 			if (!Array.isArray(allMatches) || allMatches.length === 0) {
 				allMatches = [];
 				var sports = await fetchSports();
@@ -655,7 +678,6 @@
 				: "";
 			var category = str(payload.category);
 
-			// Build a description with time info and team details
 			var descriptionLines = [];
 			if (payload.teams) {
 				if (payload.teams.home && payload.teams.home.name) {
@@ -709,16 +731,264 @@
 	}
 
 	// ---------------------------------------------------------------------------
-	// loadStreams
+	// Stream resolution engine
 	// ---------------------------------------------------------------------------
+
+	/**
+	 * Extract the value of a JavaScript string variable from HTML.
+	 * Handles: var name = "value"; or name="value";
+	 * @param {string} html
+	 * @param {string} varName
+	 * @returns {string|null}
+	 */
+	function extractJsVar(html, varName) {
+		if (!html || !varName) return null;
+
+		// Match: fid="value" or var fid="value" (with optional whitespace)
+		var regex = new RegExp(
+			"(?:var\\s+)?" +
+				varName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") +
+				'\\s*=\\s*"([^"]*)"',
+		);
+		var match = html.match(regex);
+		return match ? match[1] : null;
+	}
+
+	/**
+	 * Extract the .m3u8 stream URL from a maestrohd1.php page.
+	 *
+	 * The page has a function (with random name like `tpUtrHletg` or `trlepHttgU`)
+	 * that constructs the URL from a character array:
+	 *
+	 *   function randomName() {
+	 *     return(["h","t","t","p","s",...].join("") + var1.join("") + document.getElementById("x").innerHTML);
+	 *   }
+	 *
+	 * The base URL from the character array is the complete .m3u8 URL with md5 & expires.
+	 * The extra `+ xxx.join("") + getElementById(...)` parts are empty at runtime.
+	 *
+	 * @param {string} html - Full HTML of maestrohd1.php
+	 * @returns {string|null} Resolved .m3u8 URL, or null
+	 */
+	function extractM3u8FromMaestro(html) {
+		if (!html || typeof html !== "string") return null;
+
+		// Match: return(["chars"...].join("")
+		// The function name is random, so we match the pattern generically
+		var arrayMatch = html.match(
+			/return\s*\(\s*\[([^\]]+)\]\s*\.join\s*\(\s*""\s*\)/,
+		);
+		if (!arrayMatch) {
+			// Try alternate: join('')
+			arrayMatch = html.match(
+				/return\s*\(\s*\[([^\]]+)\]\s*\.join\s*\(\s*''\s*\)/,
+			);
+		}
+		if (!arrayMatch) return null;
+
+		// Extract all quoted strings from the character array
+		var charsStr = arrayMatch[1];
+		var charMatches = charsStr.match(
+			/"([^"\\]*(?:\\.[^"\\]*)*)"|'([^'\\]*(?:\\.[^'\\]*)*)'/g,
+		);
+		if (!charMatches || charMatches.length === 0) return null;
+
+		// Join the characters to form the URL
+		var url = "";
+		for (var i = 0; i < charMatches.length; i++) {
+			var c = charMatches[i];
+			// Remove surrounding quotes and unescape
+			if (c.length >= 2) {
+				c = c.substring(1, c.length - 1);
+				c = c.replace(/\\\//g, "/").replace(/\\\\/g, "\\").replace(/\\"/g, '"');
+			}
+			url += c;
+		}
+
+		if (!url || url.length < 10) return null;
+		return url;
+	}
+
+	/**
+	 * Resolve a non-admin embed.st URL through the embedhd.org → maestrohd1.php chain.
+	 *
+	 * Non-admin sources (golf, echo, delta) route through:
+	 *   embed.st → iframe → embedhd.org → maestrohd1.js iframe → exposestrat.com/maestrohd1.php
+	 *
+	 * The maestrohd1.php page contains a JavaScript function that constructs the
+	 * final .m3u8 URL from a character array.
+	 *
+	 * @param {string} embedhdUrl - URL from the iframe src (embedhd.org/...)
+	 * @param {object} entry - Stream entry { embedUrl, language, hd, viewers, source }
+	 * @param {string} baseUrl - Referer base URL
+	 * @returns {Promise<Array>} Array of StreamResult with the resolved .m3u8 URL
+	 */
+	async function resolveNonAdminChain(embedhdUrl, entry, baseUrl) {
+		if (!embedhdUrl) return [];
+
+		try {
+			// Step 1: Fetch embedhd.org page to get the 'fid' variable
+			var embedhdHtml = await fetchHtml(embedhdUrl, {
+				Accept: "text/html,application/xhtml+xml,*/*",
+				"User-Agent": REQ_HEADERS["User-Agent"],
+				Referer: baseUrl + "/",
+			});
+
+			if (!embedhdHtml) return [];
+
+			// Step 2: Extract the fid value
+			var fid = extractJsVar(embedhdHtml, "fid");
+			if (!fid) return [];
+
+			// Step 3: Build maestrohd1.php URL
+			// maestrohd1.js writes: <iframe src="https://exposestrat.com/maestrohd1.php?player=desktop&live={fid}">
+			var maestroUrl =
+				"https://exposestrat.com/maestrohd1.php?player=desktop&live=" +
+				encodeURIComponent(fid);
+
+			// Step 4: Fetch maestrohd1.php
+			var maestroHtml = await fetchHtml(maestroUrl, {
+				Accept: "text/html,application/xhtml+xml,*/*",
+				"User-Agent": REQ_HEADERS["User-Agent"],
+				Referer: embedhdUrl,
+			});
+
+			if (!maestroHtml) return [];
+
+			// Step 5: Extract the .m3u8 URL from the character array function
+			var streamUrl = extractM3u8FromMaestro(maestroHtml);
+			if (!streamUrl) return [];
+
+			// Step 6: Return as StreamResult with proper referer
+			var label = entry.hd ? "HD" : "SD";
+			if (entry.language && entry.language !== "Unknown") {
+				label += " [" + entry.language + "]";
+			}
+			if (entry.viewers > 0) {
+				label += " (" + entry.viewers + " viewers)";
+			}
+			label += " [" + entry.source + "]";
+
+			var streamResult = new StreamResult({
+				url: streamUrl,
+				quality: label,
+				headers: {
+					Referer: "https://exposestrat.com/",
+					"User-Agent": REQ_HEADERS["User-Agent"],
+					Origin: "https://exposestrat.com",
+				},
+			});
+
+			return [streamResult];
+		} catch (_) {
+			return [];
+		}
+	}
+
+	/**
+	 * Scrape an HTML page for iframe src URLs.
+	 * @param {string} pageUrl
+	 * @param {string} referer
+	 * @returns {Promise<string[]>}
+	 */
+	async function scrapeIframeSources(pageUrl, referer) {
+		try {
+			var resp = await http_get(pageUrl, {
+				Accept: "text/html,application/xhtml+xml,*/*",
+				"User-Agent": REQ_HEADERS["User-Agent"],
+				Referer: referer || pageUrl,
+			});
+			var html = extractBody(resp);
+			if (!html || typeof html !== "string") return [];
+
+			var found = [];
+			var regex = /<iframe[^>]*src=["']([^"']+)["']/gi;
+			var match;
+			while ((match = regex.exec(html)) !== null) {
+				var src = match[1].trim();
+				if (src && found.indexOf(src) === -1) {
+					if (src.startsWith("//")) src = "https:" + src;
+					else if (src.startsWith("/")) {
+						var base = pageUrl.match(/^https?:\/\/[^\/]+/);
+						if (base) src = base[0] + src;
+					} else if (!src.startsWith("http")) {
+						var base2 = pageUrl.match(/^https?:\/\/[^\/]+/);
+						if (base2) src = base2[0] + "/" + src;
+					}
+					found.push(src);
+				}
+			}
+			return found;
+		} catch (_) {
+			return [];
+		}
+	}
+
+	/**
+	 * Try loadExtractor on a URL and convert results to StreamResults.
+	 * @param {string} targetUrl
+	 * @param {string} label
+	 * @param {object} entry
+	 * @param {object} results - Array to append results to
+	 * @param {object} seenUrls - Set of already-seen URLs
+	 * @returns {Promise<boolean>} Whether any streams were found
+	 */
+	async function tryExtractor(targetUrl, label, entry, results, seenUrls) {
+		if (!targetUrl || seenUrls[targetUrl]) return false;
+		seenUrls[targetUrl] = true;
+
+		try {
+			if (typeof loadExtractor !== "function") return false;
+
+			var extractorResults = await loadExtractor(targetUrl);
+
+			if (Array.isArray(extractorResults) && extractorResults.length > 0) {
+				var found = false;
+				for (var i = 0; i < extractorResults.length; i++) {
+					var er = extractorResults[i];
+					if (er && str(er.url)) {
+						var streamLabel = label;
+						if (entry.hd) streamLabel = "HD " + streamLabel;
+						if (entry.language && entry.language !== "Unknown") {
+							streamLabel += " [" + entry.language + "]";
+						}
+						if (entry.viewers > 0) {
+							streamLabel += " (" + entry.viewers + " viewers)";
+						}
+
+						results.push(
+							new StreamResult({
+								url: er.url,
+								quality: er.quality || streamLabel,
+								headers: er.headers || {},
+							}),
+						);
+						found = true;
+					}
+				}
+				return found;
+			}
+		} catch (_) {}
+		return false;
+	}
 
 	/**
 	 * Resolve a single embed URL into playable StreamResult objects.
 	 *
-	 * Strategy (multi-level):
-	 *   1. Try loadExtractor() on the embed URL directly
-	 *   2. If that fails, scrape the embed page for iframe sources and try each
-	 *   3. Fall back to returning the raw embed URL (browser-embeddable)
+	 * Multi-level resolution strategy:
+	 *
+	 *   Level 0: Custom chain for non-admin embed.st URLs (golf/echo/delta):
+	 *            Follow embedhd.org → maestrohd1.php → extract .m3u8 from JS
+	 *
+	 *   Level 1: loadExtractor() on the original embed URL
+	 *
+	 *   Level 2: Scrape the embed page for <iframe> sources,
+	 *            and for each embedhd.org URL try the custom chain,
+	 *            then try loadExtractor() for other URLs.
+	 *
+	 *   Level 3: Deeper iframe chain scraping.
+	 *
+	 *   Level 4: Return the raw embed URL as last resort (may work in-app).
 	 *
 	 * @param {object} entry - { embedUrl, language, hd, viewers, source }
 	 * @param {string} baseUrl - Active Streamed base URL for Referer
@@ -731,117 +1001,92 @@
 		var results = [];
 		var seenUrls = {};
 
-		/**
-		 * Try loadExtractor on a URL and convert results to StreamResults.
-		 * @param {string} targetUrl
-		 * @param {string} label
-		 * @returns {Promise<boolean>} Whether any streams were found
-		 */
-		async function tryExtractor(targetUrl, label) {
-			if (!targetUrl || seenUrls[targetUrl]) return false;
-			seenUrls[targetUrl] = true;
+		var isNonAdmin = /\/embed\/(golf|delta|echo|alpha)\//i.test(embedUrl);
+		var isAdmin = /\/embed\/admin\//i.test(embedUrl);
 
-			try {
-				if (typeof loadExtractor !== "function") return false;
+		// --- Level 0: Custom non-admin chain (golf/echo/delta) ---
+		if (isNonAdmin) {
+			// Scrape the embed.st page for the iframe to embedhd.org
+			var iframeSources = await scrapeIframeSources(embedUrl, baseUrl + "/");
 
-				var extractorResults = await loadExtractor(targetUrl);
-
-				if (Array.isArray(extractorResults) && extractorResults.length > 0) {
-					var found = false;
-					for (var i = 0; i < extractorResults.length; i++) {
-						var er = extractorResults[i];
-						if (er && str(er.url)) {
-							var streamLabel = label;
-							if (entry.hd) streamLabel = "HD " + streamLabel;
-							if (entry.language && entry.language !== "Unknown") {
-								streamLabel += " [" + entry.language + "]";
-							}
-							if (entry.viewers > 0) {
-								streamLabel += " (" + entry.viewers + " viewers)";
-							}
-
-							results.push(
-								new StreamResult({
-									url: er.url,
-									quality: er.quality || streamLabel,
-									headers: er.headers || {},
-								}),
-							);
-							found = true;
+			for (var i0 = 0; i0 < iframeSources.length; i0++) {
+				var src = iframeSources[i0];
+				if (/embedhd\.org/i.test(src)) {
+					var chainResults = await resolveNonAdminChain(src, entry, baseUrl);
+					if (Array.isArray(chainResults) && chainResults.length > 0) {
+						for (var cr = 0; cr < chainResults.length; cr++) {
+							results.push(chainResults[cr]);
 						}
-					}
-					return found;
-				}
-			} catch (_) {
-				// Extractor failed
-			}
-			return false;
-		}
-
-		/**
-		 * Scrape an HTML page for iframe src URLs.
-		 * @param {string} pageUrl
-		 * @returns {Promise<string[]>}
-		 */
-		async function scrapeIframeSources(pageUrl) {
-			try {
-				var resp = await http_get(pageUrl, {
-					Accept: "text/html,application/xhtml+xml,*/*",
-					"User-Agent": REQ_HEADERS["User-Agent"],
-					Referer: baseUrl + "/",
-				});
-				var html = extractBody(resp);
-				if (!html || typeof html !== "string") return [];
-
-				var found = [];
-				// Extract iframe src attributes
-				var regex = /<iframe[^>]*src=["']([^"']+)["']/gi;
-				var match;
-				while ((match = regex.exec(html)) !== null) {
-					var src = match[1].trim();
-					if (src && found.indexOf(src) === -1) {
-						// Resolve relative URLs
-						if (src.startsWith("//")) src = "https:" + src;
-						else if (src.startsWith("/")) {
-							var base = pageUrl.match(/^https?:\/\/[^\/]+/);
-							if (base) src = base[0] + src;
-						} else if (!src.startsWith("http")) {
-							var base2 = pageUrl.match(/^https?:\/\/[^\/]+/);
-							if (base2) src = base2[0] + "/" + src;
-						}
-						found.push(src);
+						return results;
 					}
 				}
-				return found;
-			} catch (_) {
-				return [];
 			}
 		}
 
-		// --- Level 1: Try loadExtractor on the embed URL directly ---
+		// --- Level 1: Try loadExtractor on the original embed URL ---
 		var baseLabel = entry.hd ? "HD" : "SD";
 		if (entry.viewers > 0) baseLabel += " (" + entry.viewers + " viewers)";
 
-		var found = await tryExtractor(embedUrl, "Streamed");
+		var found = await tryExtractor(
+			embedUrl,
+			"Streamed",
+			entry,
+			results,
+			seenUrls,
+		);
 		if (found) return results;
 
-		// --- Level 2: Scrape embed page for iframe sources and try each ---
-		var iframeSources = await scrapeIframeSources(embedUrl);
-		for (var i2 = 0; i2 < iframeSources.length; i2++) {
-			found = await tryExtractor(iframeSources[i2], "Embed");
+		// --- Level 2: Scrape embed page for iframes ---
+		var iframeSources2 = await scrapeIframeSources(embedUrl, baseUrl + "/");
+
+		for (var i2 = 0; i2 < iframeSources2.length; i2++) {
+			var src2 = iframeSources2[i2];
+
+			// For non-admin sources that weren't caught at Level 0,
+			// try the custom chain now
+			if (/embedhd\.org/i.test(src2)) {
+				var chainResults2 = await resolveNonAdminChain(src2, entry, baseUrl);
+				if (Array.isArray(chainResults2) && chainResults2.length > 0) {
+					for (var cr2 = 0; cr2 < chainResults2.length; cr2++) {
+						results.push(chainResults2[cr2]);
+					}
+					return results;
+				}
+			}
+
+			found = await tryExtractor(src2, "Embed", entry, results, seenUrls);
 			if (found) return results;
 		}
 
-		// --- Level 3: Try deeper iframe chain ---
-		for (var i3 = 0; i3 < iframeSources.length && results.length === 0; i3++) {
-			var deeperSources = await scrapeIframeSources(iframeSources[i3]);
+		// --- Level 3: Deeper iframe chain ---
+		for (var i3 = 0; i3 < iframeSources2.length && results.length === 0; i3++) {
+			var deeperSources = await scrapeIframeSources(
+				iframeSources2[i3],
+				baseUrl + "/",
+			);
 			for (var i4 = 0; i4 < deeperSources.length; i4++) {
-				found = await tryExtractor(deeperSources[i4], "Embed");
+				var src4 = deeperSources[i4];
+
+				// Try custom chain for embedhd.org deeper iframes too
+				if (/embedhd\.org/i.test(src4)) {
+					var chainResults4 = await resolveNonAdminChain(src4, entry, baseUrl);
+					if (Array.isArray(chainResults4) && chainResults4.length > 0) {
+						for (var cr4 = 0; cr4 < chainResults4.length; cr4++) {
+							results.push(chainResults4[cr4]);
+						}
+						return results;
+					}
+				}
+
+				found = await tryExtractor(src4, "Embed", entry, results, seenUrls);
 				if (found) return results;
 			}
 		}
 
 		// --- Level 4: Last resort — return the embed URL itself ---
+		// For admin sources, the embed.st page has a Clappr player that may
+		// work in SkyStream's web view even without extracting the .m3u8 directly.
+		// For non-admin sources, this is the original embed.st URL.
 		results.push(
 			new StreamResult({
 				url: embedUrl,
@@ -856,6 +1101,10 @@
 		return results;
 	}
 
+	// ---------------------------------------------------------------------------
+	// loadStreams
+	// ---------------------------------------------------------------------------
+
 	/**
 	 * Resolve playable video links for a match.
 	 *
@@ -864,9 +1113,7 @@
 	 *   2. For each source, fetch /api/stream/{sourceType}/{sourceId}
 	 *   3. Collect all stream objects
 	 *   4. Sort by viewer count (desc), HD preferred
-	 *   5. Use loadExtractor() to resolve embed URLs into playable streams
-	 *   6. Multi-level fallback: iframe scraping, chain following
-	 *   7. Ultimate fallback: raw embed URL
+	 *   5. Use multi-level embed resolution to get playable streams
 	 *
 	 * @param {string} url
 	 * @param {function} cb
@@ -911,8 +1158,7 @@
 								"/" +
 								encodeURIComponent(id);
 							var streamData = await apiFetch(streamPath);
-
-							if (Array.isArray(streamData)) {
+							if (Array.isArray(streamData) && streamData.length > 0) {
 								var collected = [];
 								for (var j = 0; j < streamData.length; j++) {
 									var s = streamData[j];
@@ -929,9 +1175,7 @@
 								}
 								return collected;
 							}
-						} catch (_) {
-							// Source failed
-						}
+						} catch (_) {}
 						return [];
 					})(srcType, srcId),
 				);
@@ -957,9 +1201,7 @@
 
 			// --- Phase 2: Sort streams by quality (viewers desc, HD first) ---
 			allStreams.sort(function (a, b) {
-				// HD streams first
 				if (a.hd !== b.hd) return a.hd ? -1 : 1;
-				// Then by viewer count descending
 				return (b.viewers || 0) - (a.viewers || 0);
 			});
 
@@ -970,7 +1212,6 @@
 			for (var k = 0; k < allStreams.length; k++) {
 				var entry = allStreams[k];
 
-				// Skip duplicate embed URLs
 				if (seenEmbedUrls[entry.embedUrl]) continue;
 				seenEmbedUrls[entry.embedUrl] = true;
 
@@ -981,11 +1222,8 @@
 							streamResults.push(resolved[r]);
 						}
 					}
-				} catch (_) {
-					// Skip failed embed URL
-				}
+				} catch (_) {}
 
-				// Limit to a reasonable number of streams (max 5)
 				if (streamResults.length >= 5) break;
 			}
 
