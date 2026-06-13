@@ -49,6 +49,7 @@ function resolveRelativeUrl(baseUrl, relativePath) {
   }
   return baseUrl.replace(/\/[^/]*$/, "/") + relativePath;
 }
+
 function parseM3U8AllQualities(m3u8Content, baseUrl) {
   if (!m3u8Content || m3u8Content.indexOf("#EXTM3U") === -1) return [];
   var lines = m3u8Content.split("\n");
@@ -80,15 +81,65 @@ function parseM3U8AllQualities(m3u8Content, baseUrl) {
   return results;
 }
 
+function extractAudioTracks(m3u8Content) {
+  var tracks = [];
+  if (!m3u8Content) return tracks;
+  var lines = String(m3u8Content).split("\n");
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i];
+    if (line.indexOf("#EXT-X-MEDIA:TYPE=AUDIO") !== -1) {
+      var urlMatch = line.match(/URI="([^"]+)"/);
+      var langMatch = line.match(/LANGUAGE="([^"]+)"/);
+      var nameMatch = line.match(/NAME="([^"]+)"/);
+      var defaultMatch = line.match(/DEFAULT=([A-Z]+)/);
+      if (urlMatch && urlMatch[1]) {
+        tracks.push({
+          url: urlMatch[1],
+          label: (nameMatch && nameMatch[1]) || "Unknown",
+          lang: (langMatch && langMatch[1]) || "en",
+          default: defaultMatch && defaultMatch[1] === "YES",
+        });
+      }
+    }
+  }
+  return tracks;
+}
+
+function parseSubtitleTracks(m3u8Content) {
+  if (!m3u8Content) return [];
+  var lines = String(m3u8Content).split("\n");
+  var tracks = [];
+  var seen = {};
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i];
+    if (line.indexOf("#EXT-X-MEDIA:TYPE=SUBTITLES") !== -1) {
+      var urlMatch = line.match(/URI="([^"]+)"/);
+      var langMatch = line.match(/LANGUAGE="([^"]+)"/);
+      var nameMatch = line.match(/NAME="([^"]+)"/);
+      if (urlMatch && urlMatch[1] && !seen[urlMatch[1]]) {
+        seen[urlMatch[1]] = true;
+        tracks.push({
+          url: urlMatch[1],
+          label: (nameMatch && nameMatch[1]) || "Subtitle",
+          lang: (langMatch && langMatch[1]) || "en",
+        });
+      }
+    }
+  }
+  return tracks;
+}
+
+function sleep(ms) {
+  return new Promise(function (resolve) {
+    setTimeout(resolve, ms);
+  });
+}
+
 var SOURCE_NAME = "anyembed.xyz";
-
 var API_BASE = "https://api.anyembed.xyz";
-
 var BASE_URL = "https://anyembed.xyz";
-
 var UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36";
-
 var PROVIDERS = [
   "streamingcommunity",
   "moviesapi",
@@ -104,14 +155,8 @@ var API_HEADERS = {
   Referer: BASE_URL + "/embed/tmdb-movie-550",
 };
 
-function apiGet(url, headers, timeout) {
-  return httpGet(url, Object.assign({}, API_HEADERS, headers || {}))
-    .then(function (body) {
-      return body;
-    })
-    .catch(function (e) {
-      throw e;
-    });
+function apiGet(url, headers) {
+  return httpGet(url, Object.assign({}, API_HEADERS, headers || {}));
 }
 
 function apiPost(url, headers, body) {
@@ -147,7 +192,6 @@ function apiPost(url, headers, body) {
 }
 
 var _sessionToken = null;
-
 var _sessionExpires = 0;
 
 async function ensureSession() {
@@ -179,7 +223,19 @@ async function ensureSession() {
   }
 }
 
-async function fetchStreamSources(tmdbId, type, season, episode, token) {
+function isMasterUrl(url) {
+  return url.indexOf("master.m3u8") !== -1 || url.indexOf("/playlist/") !== -1;
+}
+
+async function tryFetchM3U8(url, headers) {
+  try {
+    var raw = await httpGet(url, headers || {});
+    if (raw && raw.indexOf("#EXTM3U") !== -1) return raw;
+  } catch (e) {}
+  return null;
+}
+
+async function fetchAllProviderSources(tmdbId, type, season, episode, token) {
   var qs = "?is_tv=" + (type === "tv");
   if (type === "tv") {
     qs += "&season=" + season + "&episode=" + episode;
@@ -187,6 +243,10 @@ async function fetchStreamSources(tmdbId, type, season, episode, token) {
   var authHeaders = {
     Authorization: "Bearer " + token,
   };
+  var allSources = [];
+  var mergedSubs = [];
+  var seenSubUrls = {};
+
   for (var pi = 0; pi < PROVIDERS.length; pi++) {
     var provider = PROVIDERS[pi];
     var url =
@@ -205,239 +265,145 @@ async function fetchStreamSources(tmdbId, type, season, episode, token) {
         continue;
       }
       if (data.error || !data.success) continue;
-      if (
-        data.sources &&
-        data.sources.length > 0 &&
-        data.sources[0].streams &&
-        data.sources[0].streams.length > 0
-      ) {
-        var testUrl = data.sources[0].streams[0].url;
-        if (testUrl && testUrl.indexOf("http") === 0) {
-          return {
-            sources: data.sources,
-            feedbackToken: data.feedback_token || null,
-            proxyToken: data.proxy_token || null,
+      if (data.sources && data.sources.length > 0) {
+        for (var si = 0; si < data.sources.length; si++) {
+          var src = data.sources[si];
+          if (!src.streams || src.streams.length === 0) continue;
+          var enriched = {
+            provider: provider,
+            name: src.name || provider,
+            streams: [],
           };
+          for (var sj = 0; sj < src.streams.length; sj++) {
+            var st = src.streams[sj];
+            if (!st.url || st.url.indexOf("http") !== 0) continue;
+            if (st.subtitles && st.subtitles.length > 0) {
+              for (var sk = 0; sk < st.subtitles.length; sk++) {
+                var sub = st.subtitles[sk];
+                var subKey = sub.url || sub.label || sub.lang;
+                if (sub.url && !seenSubUrls[sub.url]) {
+                  seenSubUrls[sub.url] = true;
+                  mergedSubs.push(sub);
+                } else if (!sub.url && !seenSubUrls[subKey]) {
+                  seenSubUrls[subKey] = true;
+                  mergedSubs.push(sub);
+                }
+              }
+            }
+            enriched.streams.push({
+              url: st.url,
+              quality: st.quality || extractQuality(st.url) || "",
+              headers: st.headers || {},
+            });
+          }
+          if (enriched.streams.length > 0) {
+            allSources.push(enriched);
+          }
         }
       }
-    } catch (e) {
-      continue;
-    }
+    } catch (e) {}
   }
-  return null;
+
+  return { sources: allSources, subtitles: mergedSubs };
 }
 
-async function fetchProxiedPlaylist(streamUrl, headers) {
-  if (!streamUrl)
-    return {
-      content: null,
-      proxyUrl: null,
-    };
-  try {
-    var encodedUrl = encodeURIComponent(streamUrl);
-    var encodedHeaders = encodeURIComponent(
-      JSON.stringify({
-        Origin: "https://vixcloud.co",
-        Referer: "https://vixcloud.co",
-      }),
-    );
-    var proxyUrl =
-      API_BASE +
-      "/api/proxy?url=" +
-      encodedUrl +
-      "&headers=" +
-      encodedHeaders +
-      "&origin=https://vixcloud.co&referer=https://vixcloud.co/";
-    var reqHeaders = {
-      "User-Agent": UA,
-      Accept: "*/*",
-      Origin: "https://anyembed.xyz",
-      Referer: "https://anyembed.xyz/",
-    };
-    var body = await httpGet(proxyUrl, reqHeaders);
-    if (body && body.length > 50 && body.indexOf("#EXTM3U") !== -1) {
-      return {
-        content: body,
-        proxyUrl: proxyUrl,
-      };
-    }
-    return {
-      content: null,
-      proxyUrl: null,
-    };
-  } catch (e) {
-    return {
-      content: null,
-      proxyUrl: null,
-    };
-  }
-}
-
-function extractAudioTracks(m3u8Content, playlistUrl) {
-  var tracks = [];
-  if (!m3u8Content) return tracks;
-  var lines = String(m3u8Content).split("\n");
-  for (var i = 0; i < lines.length; i++) {
-    var line = lines[i];
-    if (line.indexOf("#EXT-X-MEDIA:TYPE=AUDIO") !== -1) {
-      var urlMatch = line.match(/URI="([^"]+)"/);
-      var langMatch = line.match(/LANGUAGE="([^"]+)"/);
-      var nameMatch = line.match(/NAME="([^"]+)"/);
-      var defaultMatch = line.match(/DEFAULT=([A-Z]+)/);
-      if (urlMatch && urlMatch[1]) {
-        var audioUrl = urlMatch[1];
-        if (audioUrl.indexOf("http") !== 0 && playlistUrl) {
-          audioUrl = resolveRelativeUrl(playlistUrl, audioUrl);
-        }
-        tracks.push({
-          url: audioUrl,
-          label: (nameMatch && nameMatch[1]) || "Unknown",
-          lang: (langMatch && langMatch[1]) || "en",
-          default: defaultMatch && defaultMatch[1] === "YES",
-        });
-      }
-    }
-  }
-  return tracks;
-}
-
-function parseSubtitleTracks(m3u8Content, playlistUrl) {
-  if (!m3u8Content) return [];
-  var lines = String(m3u8Content).split("\n");
-  var tracks = [];
-  var seen = {};
-  for (var i = 0; i < lines.length; i++) {
-    var line = lines[i];
-    if (line.indexOf("#EXT-X-MEDIA:TYPE=SUBTITLES") !== -1) {
-      var urlMatch = line.match(/URI="([^"]+)"/);
-      var langMatch = line.match(/LANGUAGE="([^"]+)"/);
-      var nameMatch = line.match(/NAME="([^"]+)"/);
-      if (urlMatch && urlMatch[1] && !seen[urlMatch[1]]) {
-        seen[urlMatch[1]] = true;
-        var subUrl = urlMatch[1];
-        if (subUrl.indexOf("http") !== 0 && playlistUrl) {
-          subUrl = resolveRelativeUrl(playlistUrl, subUrl);
-        }
-        tracks.push({
-          url: subUrl,
-          label: (nameMatch && nameMatch[1]) || "Subtitle",
-          lang: (langMatch && langMatch[1]) || "en",
-        });
-      }
-    }
-  }
-  return tracks;
-}
-
-function isProxyUrl(url) {
-  return (
-    typeof url === "string" && url.indexOf("api.anyembed.xyz/api/proxy") !== -1
-  );
-}
-
-function streamHeaders(url, sourceHeaders) {
-  var h = {
-    "User-Agent": UA,
-  };
-  if (isProxyUrl(url)) {
-    h.Origin = "https://anyembed.xyz";
-    h.Referer = "https://anyembed.xyz/";
-  } else {
-    h.Origin = (sourceHeaders && sourceHeaders.Origin) || "https://vixcloud.co";
-    h.Referer =
-      (sourceHeaders && sourceHeaders.Referer) || "https://vixcloud.co/";
-  }
-  return h;
-}
-
-function buildStreams(
-  apiResult,
-  playlistContent,
-  playlistUrl,
-  playlistHeaders,
-) {
+async function buildStreams(sourcesData, mergedSubtitles) {
   var streams = [];
   var seenUrls = {};
-  if (!apiResult || !apiResult.sources) return streams;
-  var apiSubtitles = [];
-  for (var si = 0; si < apiResult.sources.length; si++) {
-    var src = apiResult.sources[si];
-    if (src.streams) {
-      for (var sj = 0; sj < src.streams.length; sj++) {
-        if (src.streams[sj].subtitles && src.streams[sj].subtitles.length > 0) {
-          apiSubtitles = src.streams[sj].subtitles;
-          break;
-        }
-      }
-    }
-    if (apiSubtitles.length > 0) break;
-  }
-  if (playlistContent && playlistContent.indexOf("#EXTM3U") !== -1) {
-    var variants = parseM3U8AllQualities(playlistContent, playlistUrl);
-    var playlistSubs = parseSubtitleTracks(playlistContent, playlistUrl);
-    var audioTracks = extractAudioTracks(playlistContent, playlistUrl);
-    if (variants.length > 0) {
-      var ts = Date.now();
-      for (var vi = 0; vi < variants.length; vi++) {
-        var v = variants[vi];
-        var vUrl = playlistUrl + "#" + v.quality + "-" + ts;
-        var entry = {
-          url: vUrl,
-          quality: v.quality,
-          headers: streamHeaders(playlistUrl, playlistHeaders),
-        };
-        if (playlistSubs.length > 0) {
-          entry.subtitles = playlistSubs;
-        } else if (apiSubtitles.length > 0) {
-          entry.subtitles = apiSubtitles;
-        }
-        if (audioTracks.length > 0) {
-          entry.audio = audioTracks;
-        }
-        streams.push(entry);
-      }
-      var masterUrl = playlistUrl + "#master-" + ts;
-      var masterEntry = {
-        url: masterUrl,
-        quality: extractQuality(masterUrl) || "Auto",
-        headers: streamHeaders(playlistUrl, playlistHeaders),
-      };
-      if (playlistSubs.length > 0) {
-        masterEntry.subtitles = playlistSubs;
-      } else if (apiSubtitles.length > 0) {
-        masterEntry.subtitles = apiSubtitles;
-      }
-      if (audioTracks.length > 0) {
-        masterEntry.audio = audioTracks;
-      }
-      streams.push(masterEntry);
-      return streams;
-    }
-  }
-  for (var si2 = 0; si2 < apiResult.sources.length; si2++) {
-    var src2 = apiResult.sources[si2];
-    if (!src2.streams) continue;
-    for (var sj2 = 0; sj2 < src2.streams.length; sj2++) {
-      var st = src2.streams[sj2];
+  var ts = Date.now();
+
+  for (var si = 0; si < sourcesData.length; si++) {
+    var src = sourcesData[si];
+    for (var sj = 0; sj < src.streams.length; sj++) {
+      var st = src.streams[sj];
       if (!st.url || seenUrls[st.url]) continue;
       seenUrls[st.url] = true;
-      var fHeaders = streamHeaders(st.url, st.headers);
-      var fSubs = st.subtitles || apiSubtitles;
-      streams.push({
+
+      var entry = {
         url: st.url,
-        quality: st.quality || extractQuality(st.url) || "Auto",
-        headers: fHeaders,
-        subtitles: fSubs,
-      });
+        source: SOURCE_NAME,
+        quality: st.quality || "Auto",
+        headers: {
+          "User-Agent": UA,
+        },
+      };
+      if (st.headers) {
+        entry.headers.Referer =
+          st.headers.Referer || st.headers.referer || entry.headers.Referer;
+        entry.headers.Origin =
+          st.headers.Origin || st.headers.origin || entry.headers.Origin;
+        if (st.headers["user-agent"] || st.headers["User-Agent"]) {
+          entry.headers["User-Agent"] =
+            st.headers["user-agent"] || st.headers["User-Agent"];
+        }
+      }
+      if (mergedSubtitles.length > 0) {
+        entry.subtitles = mergedSubtitles;
+      }
+      entry._provider = src.provider;
+      streams.push(entry);
     }
   }
-  return streams;
-}
 
-function sleep(ms) {
-  return new Promise(function (resolve) {
-    setTimeout(resolve, ms);
-  });
+  var masterStreams = [];
+
+  for (var si2 = 0; si2 < streams.length; si2++) {
+    var st2 = streams[si2];
+    if (isMasterUrl(st2.url)) {
+      var masterContent = null;
+      try {
+        masterContent = await tryFetchM3U8(st2.url, st2.headers);
+      } catch (e) {}
+
+      if (masterContent && masterContent.indexOf("#EXT-X-STREAM-INF") !== -1) {
+        var variants = parseM3U8AllQualities(masterContent, st2.url);
+        var audioTracks = extractAudioTracks(masterContent);
+        var subsFromMaster = parseSubtitleTracks(masterContent);
+
+        if (variants.length > 0) {
+          var fromMaster = [];
+          for (var vi = 0; vi < variants.length; vi++) {
+            var v = variants[vi];
+            var vUrl = st2.url + "#" + v.quality + "-" + ts;
+            var ve = {
+              url: vUrl,
+              source: SOURCE_NAME,
+              quality: v.quality,
+              headers: st2.headers,
+              subtitles:
+                subsFromMaster.length > 0
+                  ? subsFromMaster
+                  : mergedSubtitles.length > 0
+                    ? mergedSubtitles
+                    : undefined,
+            };
+            if (audioTracks.length > 0) {
+              ve.audio = audioTracks;
+            }
+            fromMaster.push(ve);
+          }
+          masterStreams = masterStreams.concat(fromMaster);
+          continue;
+        }
+      }
+    }
+    masterStreams.push(st2);
+  }
+
+  if (masterStreams.length > 0) {
+    var deduped = [];
+    var dedupSeen = {};
+    for (var di = 0; di < masterStreams.length; di++) {
+      var ds = masterStreams[di];
+      var key = ds.quality + "|" + ds.url.split("#")[0];
+      if (dedupSeen[key]) continue;
+      dedupSeen[key] = true;
+      deduped.push(ds);
+    }
+    return deduped;
+  }
+
+  return streams;
 }
 
 async function scrapeStreams(params) {
@@ -447,23 +413,23 @@ async function scrapeStreams(params) {
   var season = parseInt(params.season, 10) || 1;
   var episode = parseInt(params.episode, 10) || 1;
   if (!tmdbId || tmdbId < 1) {
-    return fail("invalid tmdbId");
+    return makeFail(SOURCE_NAME, "invalid tmdbId", start);
   }
   try {
     var token;
     try {
       token = await ensureSession();
     } catch (e) {
-      return fail("auth: " + e.message);
+      return makeFail(SOURCE_NAME, "auth: " + e.message, start);
     }
-    var apiResult = await fetchStreamSources(
+    var apiData = await fetchAllProviderSources(
       tmdbId,
       type,
       season,
       episode,
       token,
     );
-    if (!apiResult || !apiResult.sources || apiResult.sources.length === 0) {
+    if (!apiData || !apiData.sources || apiData.sources.length === 0) {
       return {
         source: SOURCE_NAME,
         status: "no_streams",
@@ -471,33 +437,9 @@ async function scrapeStreams(params) {
         latency_ms: Date.now() - start,
       };
     }
-    var firstStream = null;
-    var firstHeaders = null;
-    for (var si = 0; si < apiResult.sources.length; si++) {
-      var src = apiResult.sources[si];
-      if (src.streams && src.streams.length > 0) {
-        for (var si2 = 0; si2 < src.streams.length; si2++) {
-          var st = src.streams[si2];
-          if (st.url && st.url.indexOf("http") === 0) {
-            firstStream = st.url;
-            firstHeaders = st.headers || {};
-            break;
-          }
-        }
-      }
-      if (firstStream) break;
-    }
-    var playlistContent = null;
-    if (firstStream) {
-      var plResult = await fetchProxiedPlaylist(firstStream, firstHeaders);
-      playlistContent = plResult.content;
-    }
-    var streams = buildStreams(
-      apiResult,
-      playlistContent,
-      firstStream,
-      firstHeaders,
-    );
+
+    var streams = await buildStreams(apiData.sources, apiData.subtitles);
+
     if (streams.length === 0) {
       return {
         source: SOURCE_NAME,
@@ -506,6 +448,7 @@ async function scrapeStreams(params) {
         latency_ms: Date.now() - start,
       };
     }
+
     return {
       source: SOURCE_NAME,
       status: "working",
@@ -513,10 +456,7 @@ async function scrapeStreams(params) {
       latency_ms: Date.now() - start,
     };
   } catch (e) {
-    return fail(e.message);
-  }
-  function fail(msg) {
-    return makeFail(SOURCE_NAME, msg, start);
+    return makeFail(SOURCE_NAME, e.message || String(e), start);
   }
 }
 
