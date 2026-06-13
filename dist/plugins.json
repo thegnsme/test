@@ -1,0 +1,53 @@
+[
+  {
+    "packageName": "com.multisource.streams.multisource",
+    "name": "MultiSource",
+    "version": 2,
+    "baseUrl": "https://example.com",
+    "description": "MultiSource Plugin v2 — 12 streaming sources aggregated via TMDB with subtitle enrichment",
+    "authors": [
+      "MultiSource Team"
+    ],
+    "languages": [
+      "en"
+    ],
+    "categories": [
+      "Streaming",
+      "Movies",
+      "TV",
+      "Anime"
+    ],
+    "url": "https://raw.githubusercontent.com/thegnsme/test/repo/dist/com.multisource.streams.multisource.sky"
+  },
+  {
+    "packageName": "com.streamed.live",
+    "name": "Streamed",
+    "version": 1,
+    "baseUrl": "https://streami.su",
+    "description": "Live sports streaming from Streamed — football, basketball, tennis, cricket, MMA and more. Dynamically fetches live events with real-time domain resolution and multi-level embed extraction.",
+    "authors": [
+      "Streamed Plugin Team"
+    ],
+    "languages": [
+      "en"
+    ],
+    "categories": [
+      "LiveTv"
+    ],
+    "domains": [
+      {
+        "name": "streami.su",
+        "url": "https://streami.su"
+      },
+      {
+        "name": "streamed.pk",
+        "url": "https://streamed.pk"
+      },
+      {
+        "name": "streamed.st",
+        "url": "https://streamed.st"
+      }
+    ],
+    "url": "https://raw.githubusercontent.com/thegnsme/test/repo/dist/com.streamed.live.sky"
+  }
+]
