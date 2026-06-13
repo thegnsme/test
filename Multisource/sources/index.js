@@ -7,9 +7,10 @@ var SOURCES_REGISTRY = {
   ezvidapi: require("./ezvidapi"),
   "apiplayer.ru": require("./apiplayer_ru"),
   "mapple.uk": require("./mapple_uk"),
+  "anyembed.xyz": require("./anyembed_xyz"),
   vidsrc: require("./vidsrc"),
   vixsrc: require("./vixsrc"),
-  "vidcore.net": require("./vidcore_net"),
+  "vidking.net": require("./vidking_net"),
 };
 
 var SOURCE_TIMEOUT = 6e4;
@@ -22,7 +23,9 @@ var HEALTH_RESET_AFTER = 3e5;
 
 var SOURCE_TIMEOUT_OVERRIDES = {
   lordflix: 45e3,
+  "anyembed.xyz": 3e4,
   ezvidapi: 2e4,
+  "vidking.net": 45e3,
 };
 
 var _health = {};
