@@ -1,49 +1,69 @@
-"use strict";
-
-/**
- * PrimeSrc Source — primesrc.me
- *
- * API-based source: queries a REST endpoint by TMDB ID to get
- * a list of available video servers, then resolves each to a
- * playable M3U8 URL.
- *
- * Flow:
- *   1. GET /api/v1/s?tmdb={id}&type=movie|tv → server list
- *   2. For each server: GET /api/v1/l?key={key} → redirect URL
- *   3. Check if URL is already M3U8; if not, fetch the page and
- *      try to extract an M3U8 from it (supports common embed hosts)
- *
- * Ported from: streamflix-reborn PrimeSrcExtractor.kt
- *
- * @module sources/primesrc
- */
-
-// ═════════════════════════════════════════════════════════════════════════════
-// Constants
-// ═════════════════════════════════════════════════════════════════════════════
+// file: sources/primesrc.js
+//
+// PrimeSrc Source — primesrc.me
+//
+// API: GET /api/v1/s?tmdb={id}&type=movie|tv → returns JSON server list
+// Each server has { name, key } — we construct the final embed URL directly
+// using known host patterns, then try to extract M3U8 from embed pages.
+//
+// Supported embed hosts: Streamtape, Voe, Dood, Filemoon, Streamwish,
+// Mixdrop, Filelions, Luluvdoo, Vidmoly
 
 var SOURCE_NAME = "primesrc";
 var BASE_URL = "https://primesrc.me";
+var UA =
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36";
 
-// ═════════════════════════════════════════════════════════════════════════════
-// Helpers
-// ═════════════════════════════════════════════════════════════════════════════
+// Known embed host URL patterns — construct URL directly from server key
+var EMBED_HOSTS = {
+	streamtape: { domain: "streamtape.com", path: "/e/%s/" },
+	voe: { domain: "voe.sx", path: "/e/%s" },
+	dood: { domain: "dood.la", path: "/e/%s" },
+	doodstream: { domain: "doodstream.com", path: "/e/%s" },
+	filemoon: { domain: "filemoon.sx", path: "/e/%s" },
+	streamwish: { domain: "streamwish.to", path: "/e/%s" },
+	mixdrop: { domain: "mixdrop.co", path: "/e/%s" },
+	filelions: { domain: "filelions.to", path: "/e/%s" },
+	luluvdoo: { domain: "luluvdoo.com", path: "/e/%s" },
+	vidmoly: { domain: "vidmoly.to", path: "/embed/%s" },
+};
 
-function makeFail(src, msg, start) {
-	return {
-		source: src,
-		status: "error",
-		error: msg || "unknown",
-		streams: [],
-		latency_ms: Date.now() - (start || Date.now()),
-	};
+function getEmbedUrl(serverName, key) {
+	var lookup = (serverName || "").toLowerCase().trim();
+	// Try direct match first
+	var host = EMBED_HOSTS[lookup];
+	if (host)
+		return (
+			"https://" +
+			host.domain +
+			host.path.replace("%s", encodeURIComponent(key))
+		);
+
+	// Check if the name contains any known host keyword
+	for (var known in EMBED_HOSTS) {
+		if (lookup.indexOf(known) !== -1) {
+			host = EMBED_HOSTS[known];
+			return (
+				"https://" +
+				host.domain +
+				host.path.replace("%s", encodeURIComponent(key))
+			);
+		}
+	}
+
+	return null;
 }
 
-function extractQuality(url) {
-	var u = String(url || "");
-	var m = u.match(/(2160p|1440p|1080p|720p|480p|360p)/i);
-	if (m) return m[1].toLowerCase();
-	if (/\b4k\b/i.test(u)) return "4K";
+async function httpGet(url, headers) {
+	try {
+		// Do NOT pass 3rd argument — globalThis.http_get takes (url, headers) only
+		var raw = await globalThis.http_get(url, headers || {});
+		if (typeof raw === "string") return raw;
+		if (raw && raw.body) {
+			if (typeof raw.body === "string") return raw.body;
+			if (typeof raw.body === "object") return JSON.stringify(raw.body);
+		}
+	} catch (e) {}
 	return "";
 }
 
@@ -56,197 +76,167 @@ function safeJsonParse(str) {
 	}
 }
 
-async function httpGet(url, headers) {
-	var raw = await globalThis.http_get(url, headers || {});
-	if (typeof raw === "string") return raw;
-	if (raw && raw.body) {
-		if (typeof raw.body === "string") return raw.body;
-		if (typeof raw.body === "object") return JSON.stringify(raw.body);
-	}
+function extractQuality(url) {
+	var u = String(url || "");
+	var m = u.match(/(2160p|1440p|1080p|720p|480p|360p)/i);
+	if (m) return m[1].toLowerCase();
+	if (/\b4k\b/i.test(u)) return "4K";
 	return "";
 }
 
-function getBaseUrl(url) {
-	var m = url.match(/^(https?:\/\/[^/]+)/);
-	return m ? m[1] : "";
-}
-
-// ═════════════════════════════════════════════════════════════════════════════
-// Embed page M3U8 extraction (fallback for non-direct URLs)
-// ═════════════════════════════════════════════════════════════════════════════
-
-/**
- * Try to extract a direct M3U8 URL from an embed page HTML.
- * Supports common patterns:
- *   - Direct M3U8 URL in the page
- *   - source: "..." or file: "..." in JS
- *   - iframe with M3U8 src
- */
-function extractM3u8FromHtml(html, pageUrl) {
+// Try to extract M3U8 from HTML of an embed page
+function extractM3U8FromHtml(html) {
 	if (!html) return null;
-
-	var patterns = [
-		// Direct M3U8 URL
-		/https?:\/\/[^"'\s]+\.m3u8[^"'\s]*/gi,
-		// source/file: "URL" in JS
+	// Direct M3U8 URL
+	var m = html.match(/https?:\/\/[^"'\s]+\.m3u8[^"'\s]*/i);
+	if (m) return m[0];
+	// source/file/src in JavaScript
+	var m2 = html.match(
 		/(?:source|file|src)\s*:\s*["']([^"']+\.m3u8[^"']*)["']/i,
-		// iframe src
-		/<iframe[^>]*src=["']([^"']+\.m3u8[^"']*)["']/i,
-	];
-
-	// Try direct M3U8 regex first
-	var dm = html.match(patterns[0]);
-	if (dm && dm[0]) return dm[0];
-
-	// Try source/file pattern
-	var sm = html.match(patterns[1]);
-	if (sm) return resolveUrl(pageUrl, sm[1]);
-
+	);
+	if (m2) return m2[1].indexOf("http") === 0 ? m2[1] : "https:" + m2[1];
 	return null;
 }
-
-function resolveUrl(base, path) {
-	if (!path) return "";
-	if (path.indexOf("//") === 0) return "https:" + path;
-	if (path.indexOf("http") === 0) return path;
-	if (path.indexOf("/") === 0) return getBaseUrl(base) + path;
-	return base.replace(/\/[^/]*$/, "/") + path;
-}
-
-// ═════════════════════════════════════════════════════════════════════════════
-// API interaction
-// ═════════════════════════════════════════════════════════════════════════════
-
-function buildApiUrl(tmdbId, type, season, episode) {
-	var base = BASE_URL + "/api/v1/s?tmdb=" + tmdbId;
-	if (type === "tv" || type === "show") {
-		base += "&type=tv&season=" + (season || 1) + "&episode=" + (episode || 1);
-	} else {
-		base += "&type=movie";
-	}
-	return base;
-}
-
-/**
- * Fetch server list from PrimeSrc API.
- */
-async function fetchServers(tmdbId, type, season, episode) {
-	var apiUrl = buildApiUrl(tmdbId, type, season, episode);
-	var raw = await httpGet(apiUrl, {
-		"User-Agent":
-			"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-		Referer: BASE_URL,
-	});
-	if (!raw) throw new Error("Empty API response");
-
-	var data = safeJsonParse(raw);
-	if (!data || !data.servers || !Array.isArray(data.servers)) {
-		throw new Error("Invalid API response format");
-	}
-	return data.servers;
-}
-
-/**
- * Resolve a server key to a playable URL.
- */
-async function resolveServerKey(key) {
-	var url = BASE_URL + "/api/v1/l?key=" + encodeURIComponent(key);
-	var raw = await httpGet(url, {
-		"User-Agent":
-			"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-		Referer: BASE_URL,
-	});
-	if (!raw) throw new Error("Empty link response");
-
-	var data = safeJsonParse(raw);
-	if (!data || !data.link) throw new Error("No link in response");
-	return data.link;
-}
-
-/**
- * Try to get a playable M3U8 URL from a given URL.
- * If the URL already ends with .m3u8, return it directly.
- * Otherwise, fetch the page and try to extract an M3U8.
- */
-async function resolveToM3u8(linkUrl) {
-	// Already an M3U8 URL
-	if (linkUrl.indexOf(".m3u8") > 0) return linkUrl;
-
-	// Fetch the page and try to extract M3U8
-	var html = await httpGet(linkUrl, {
-		"User-Agent":
-			"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-		Referer: getBaseUrl(linkUrl),
-	});
-	if (!html) return null;
-
-	var extracted = extractM3u8FromHtml(html, linkUrl);
-	return extracted;
-}
-
-// ═════════════════════════════════════════════════════════════════════════════
-// scrapeStreams
-// ═════════════════════════════════════════════════════════════════════════════
 
 async function scrapeStreams(params) {
 	var start = Date.now();
 	var tmdbId = parseInt(params.tmdbId, 10);
 	if (!tmdbId || tmdbId < 1) {
-		return makeFail(SOURCE_NAME, "invalid tmdbId", start);
+		return {
+			source: SOURCE_NAME,
+			status: "error",
+			error: "invalid tmdbId",
+			streams: [],
+			latency_ms: Date.now() - start,
+		};
 	}
 
 	try {
-		// Step 1: Get server list
-		var servers = await fetchServers(
-			tmdbId,
-			params.type,
-			params.season,
-			params.episode,
-		);
-
-		if (!servers || servers.length === 0) {
-			return makeFail(SOURCE_NAME, "no servers returned", start);
+		// Fetch server list from API
+		var apiUrl = BASE_URL + "/api/v1/s?tmdb=" + tmdbId;
+		if (params.type === "tv" || params.type === "series") {
+			apiUrl +=
+				"&type=tv&season=" +
+				(params.season || 1) +
+				"&episode=" +
+				(params.episode || 1);
+		} else {
+			apiUrl += "&type=movie";
 		}
 
-		// Step 2: Resolve each server key to a playable URL
+		var raw = await httpGet(apiUrl, {
+			"User-Agent": UA,
+			Referer: BASE_URL,
+			Accept: "application/json, text/plain, */*",
+		});
+		if (!raw) {
+			return {
+				source: SOURCE_NAME,
+				status: "error",
+				error: "empty API response",
+				streams: [],
+				latency_ms: Date.now() - start,
+			};
+		}
+
+		var data = safeJsonParse(raw);
+		if (!data || !data.servers || !Array.isArray(data.servers)) {
+			return {
+				source: SOURCE_NAME,
+				status: "error",
+				error: "invalid API response",
+				streams: [],
+				latency_ms: Date.now() - start,
+			};
+		}
+
 		var streams = [];
 		var seenUrls = {};
 
-		for (var si = 0; si < servers.length; si++) {
-			var server = servers[si];
-			var key = server.key;
-			var name = server.name || "Server " + (si + 1);
+		for (var si = 0; si < data.servers.length; si++) {
+			var server = data.servers[si];
+			var name = server.name || "";
+			var key = server.key || "";
+			if (!name || !key) continue;
 
+			// Construct embed URL directly from known host patterns
+			var embedUrl = getEmbedUrl(name, key);
+			if (!embedUrl) {
+				// Unknown host — try API link resolution as fallback
+				try {
+					var linkUrl = BASE_URL + "/api/v1/l?key=" + encodeURIComponent(key);
+					var linkRaw = await httpGet(linkUrl, {
+						"User-Agent": UA,
+						Referer: BASE_URL,
+					});
+					var linkData = safeJsonParse(linkRaw);
+					if (linkData && linkData.link) embedUrl = linkData.link;
+				} catch (e) {}
+				if (!embedUrl) continue;
+			}
+
+			// Deduplicate by embed URL
+			if (seenUrls[embedUrl]) continue;
+			seenUrls[embedUrl] = true;
+
+			// Try to extract M3U8 from the embed page
 			try {
-				var linkUrl = await resolveServerKey(key);
-				if (!linkUrl) continue;
-
-				var m3u8Url = await resolveToM3u8(linkUrl);
-				if (!m3u8Url || seenUrls[m3u8Url]) continue;
-				seenUrls[m3u8Url] = true;
-
-				var q = extractQuality(m3u8Url) || "Auto";
-				var displayLabel = name + " (PrimeSrc)";
-				if (q && q !== "Auto") displayLabel += " [" + q + "]";
-
-				streams.push({
-					url: m3u8Url,
-					source: displayLabel,
-					quality: q,
-					headers: {
-						Referer: getBaseUrl(linkUrl),
-						"User-Agent":
-							"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-					},
+				var embedHtml = await httpGet(embedUrl, {
+					"User-Agent": UA,
+					Referer: embedUrl,
+					Accept: "text/html,application/xhtml+xml",
 				});
+
+				if (embedHtml) {
+					var m3u8Url = extractM3U8FromHtml(embedHtml);
+					if (m3u8Url && !seenUrls[m3u8Url]) {
+						seenUrls[m3u8Url] = true;
+						var q = extractQuality(m3u8Url) || "Auto";
+						streams.push({
+							url: m3u8Url,
+							quality: q,
+							headers: {
+								"User-Agent": UA,
+								Referer: embedUrl,
+							},
+						});
+					}
+				}
+				// If extraction failed, try fetching the API link resolution
+				else if (!embedHtml || embedHtml.length < 50) {
+					// Try the API link endpoint
+					var linkUrl = BASE_URL + "/api/v1/l?key=" + encodeURIComponent(key);
+					var linkRaw = await httpGet(linkUrl, {
+						"User-Agent": UA,
+						Referer: BASE_URL,
+					});
+					var linkData = safeJsonParse(linkRaw);
+					if (linkData && linkData.link && !seenUrls[linkData.link]) {
+						seenUrls[linkData.link] = true;
+						// Check if it's already M3U8
+						if (linkData.link.indexOf(".m3u8") > 0) {
+							var q2 = extractQuality(linkData.link) || "Auto";
+							streams.push({
+								url: linkData.link,
+								quality: q2,
+								headers: { "User-Agent": UA, Referer: BASE_URL },
+							});
+						}
+					}
+				}
 			} catch (e) {
 				// Skip failed servers
-				continue;
 			}
 		}
 
 		if (streams.length === 0) {
-			return makeFail(SOURCE_NAME, "no playable streams resolved", start);
+			return {
+				source: SOURCE_NAME,
+				status: "error",
+				error: "no playable streams",
+				streams: [],
+				latency_ms: Date.now() - start,
+			};
 		}
 
 		return {
@@ -256,7 +246,13 @@ async function scrapeStreams(params) {
 			latency_ms: Date.now() - start,
 		};
 	} catch (e) {
-		return makeFail(SOURCE_NAME, e && e.message ? e.message : String(e), start);
+		return {
+			source: SOURCE_NAME,
+			status: "error",
+			error: e && e.message ? e.message : String(e),
+			streams: [],
+			latency_ms: Date.now() - start,
+		};
 	}
 }
 
