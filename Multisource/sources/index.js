@@ -10,6 +10,7 @@ var SOURCES_REGISTRY = {
   "anyembed.xyz": require("./anyembed_xyz"),
   vidsrc: require("./vidsrc"),
   vixsrc: require("./vixsrc"),
+  "vidcore.net": require("./vidcore_net"),
 };
 
 var SOURCE_TIMEOUT = 6e4;
