@@ -61,7 +61,6 @@ var PER_SERVER_TIMEOUT = 20000;
 
 function makeFail(msg, start) {
 	return {
-		source: SOURCE_NAME,
 		status: "error",
 		error: msg || "unknown",
 		streams: [],
@@ -696,7 +695,6 @@ async function scrapeStreams(params) {
 					errors.push(res2.value.label + ": " + res2.value.error);
 			}
 			return {
-				source: SOURCE_NAME,
 				status: "no_streams",
 				error: errors.join("; ") || "all servers returned no streams",
 				streams: [],
@@ -717,7 +715,6 @@ async function scrapeStreams(params) {
 		);
 
 		return {
-			source: SOURCE_NAME,
 			status: "working",
 			streams: allStreams,
 			latency_ms: Date.now() - start,

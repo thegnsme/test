@@ -311,6 +311,15 @@
 			if (n >= 360) return "360p";
 			return m[1] + "p";
 		}
+		// Check percent-encoded src parameter for quality
+		m = u.match(/src=([^&]+)/);
+		if (m) {
+			try {
+				var decoded = decodeURIComponent(m[1]);
+				var dm = decoded.match(/(2160p|1440p|1080p|720p|480p|360p)/i);
+				if (dm) return dm[1].toLowerCase();
+			} catch (e) {}
+		}
 		return "";
 	}
 
@@ -741,7 +750,7 @@
 				seenUrls[s.url] = true;
 
 				var q = s.quality || extractQualityFromUrl(s.url);
-				var baseSource = src.source || s.source || "Source";
+				var baseSource = s.source || src.source || "Source";
 
 				var displayLabel = baseSource;
 				if (q && q !== "Auto" && q !== "auto") {
