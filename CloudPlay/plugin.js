@@ -396,7 +396,7 @@
 	}
 
 	// ═══════════════════════════════════════════════════════════════════════════
-	// HLS Master Playlist Parser (Quality Selection)
+	// HLS Master Playlist Parser (Quality Selection + Audio Groups)
 	// ═══════════════════════════════════════════════════════════════════════════
 
 	function parseHlsAttributes(line) {
@@ -447,38 +447,87 @@
 		return 0;
 	}
 
+	/**
+	 * Parse HLS master playlist into variants and media groups
+	 * Returns { variants: [{url, attributes}], mediaGroups: {AUDIO: {groupId: [{uri, language, name}]}} }
+	 */
 	function parseHlsMasterPlaylist(manifestText, manifestUrl) {
-		const variants = [];
+		const info = {
+			variants: [],
+			version: "",
+			independentSegments: false,
+			mediaGroups: {
+				AUDIO: {},
+				SUBTITLES: {},
+				"CLOSED-CAPTIONS": {},
+			},
+		};
 		const lines = String(manifestText || "").split(/\r?\n/);
 		let pendingAttributes = null;
 
 		lines.forEach(function (rawLine) {
 			const line = rawLine.trim();
 			if (!line) return;
+
+			if (line.startsWith("#EXT-X-VERSION:")) {
+				info.version = clean(line.slice("#EXT-X-VERSION:".length));
+				return;
+			}
+
+			if (line === "#EXT-X-INDEPENDENT-SEGMENTS") {
+				info.independentSegments = true;
+				return;
+			}
+
+			if (line.startsWith("#EXT-X-MEDIA:")) {
+				const attributes = parseHlsAttributes(
+					line.slice("#EXT-X-MEDIA:".length),
+				);
+				const mediaType = clean(attributes.TYPE).toUpperCase();
+				const groupId = clean(attributes["GROUP-ID"]);
+				if (!mediaType || !groupId) return;
+				if (attributes.URI) {
+					attributes.URI = resolveVariantUrl(manifestUrl, attributes.URI);
+				}
+				if (!info.mediaGroups[mediaType]) info.mediaGroups[mediaType] = {};
+				if (!info.mediaGroups[mediaType][groupId])
+					info.mediaGroups[mediaType][groupId] = [];
+				info.mediaGroups[mediaType][groupId].push(attributes);
+				return;
+			}
+
 			if (line.startsWith("#EXT-X-STREAM-INF:")) {
 				pendingAttributes = parseHlsAttributes(
 					line.slice("#EXT-X-STREAM-INF:".length),
 				);
 				return;
 			}
+
 			if (line.startsWith("#")) return;
+
 			if (pendingAttributes) {
 				const resolved = resolveVariantUrl(manifestUrl, line);
 				if (resolved) {
-					const quality = parseVariantQuality(pendingAttributes);
-					variants.push({
+					info.variants.push({
 						url: resolved,
-						quality: quality,
+						attributes: pendingAttributes,
 					});
 				}
 				pendingAttributes = null;
 			}
 		});
 
-		variants.sort(function (a, b) {
-			return b.quality - a.quality;
-		});
-		return variants;
+		return info;
+	}
+
+	function shouldExpandHlsVariants(url) {
+		const value = clean(url).toLowerCase();
+		if (!value || /\.mpd(?:$|[?#])/i.test(value)) return false;
+		return (
+			/\.m3u8(?:$|[?#])/i.test(value) ||
+			value.includes("/hls/") ||
+			value.includes("m3u8")
+		);
 	}
 
 	function isHlsMasterPlaylist(url) {
@@ -492,6 +541,308 @@
 
 	function isDashManifest(url) {
 		return clean(url).toLowerCase().includes(".mpd");
+	}
+
+	// ═══════════════════════════════════════════════════════════════════════════
+	// DASH MPD Manifest Parser (Quality Selection)
+	// ═══════════════════════════════════════════════════════════════════════════
+
+	function parseMpdRepresentationQuality(representation) {
+		if (!representation || typeof representation !== "object") return 0;
+		const resolution = representation.height;
+		if (resolution && resolution > 0) {
+			if (resolution >= 4320) return 4320;
+			if (resolution >= 2160) return 2160;
+			if (resolution >= 1080) return 1080;
+			if (resolution >= 720) return 720;
+			if (resolution >= 480) return 480;
+			if (resolution >= 360) return 360;
+			if (resolution >= 240) return 240;
+			if (resolution >= 144) return 144;
+		}
+		const bandwidth = representation.bandwidth;
+		if (bandwidth && bandwidth > 0) {
+			if (bandwidth >= 20000000) return 2160;
+			if (bandwidth >= 10000000) return 1080;
+			if (bandwidth >= 6000000) return 720;
+			if (bandwidth >= 3000000) return 480;
+			if (bandwidth >= 1500000) return 360;
+			if (bandwidth >= 800000) return 240;
+			if (bandwidth >= 400000) return 144;
+		}
+		return 0;
+	}
+
+	function parseMpdMasterPlaylist(manifestText, manifestUrl) {
+		const info = {
+			variants: [],
+			version: "",
+			mediaGroups: {
+				AUDIO: [],
+				VIDEO: [],
+			},
+		};
+		const lines = String(manifestText || "").split(/\r?\n/);
+		let currentAdaptationSet = null;
+		let currentRepresentation = null;
+
+		lines.forEach(function (rawLine) {
+			const line = rawLine.trim();
+			if (!line) return;
+
+			if (line.includes("<AdaptationSet")) {
+				currentAdaptationSet = {
+					id: null,
+					mimeType: null,
+					codecs: null,
+					bandwidth: null,
+					width: null,
+					height: null,
+					frameRate: null,
+					audioSamplingRate: null,
+					lang: null,
+					representations: [],
+				};
+
+				var mimeTypeMatch = line.match(/mimeType="([^"]*)"/);
+				if (mimeTypeMatch) currentAdaptationSet.mimeType = mimeTypeMatch[1];
+
+				var codecsMatch = line.match(/codecs="([^"]*)"/);
+				if (codecsMatch) currentAdaptationSet.codecs = codecsMatch[1];
+
+				var langMatch = line.match(/lang="([^"]*)"/);
+				if (langMatch) currentAdaptationSet.lang = langMatch[1];
+
+				var bandwidthMatch = line.match(/bandwidth="?(\d+)?"?/);
+				if (bandwidthMatch)
+					currentAdaptationSet.bandwidth = bandwidthMatch[1]
+						? parseInt(bandwidthMatch[1])
+						: null;
+
+				var widthMatch = line.match(/width="?(\d+)?"?/);
+				if (widthMatch)
+					currentAdaptationSet.width = widthMatch[1]
+						? parseInt(widthMatch[1])
+						: null;
+
+				var heightMatch = line.match(/height="?(\d+)?"?/);
+				if (heightMatch)
+					currentAdaptationSet.height = heightMatch[1]
+						? parseInt(heightMatch[1])
+						: null;
+
+				var frameRateMatch = line.match(/frameRate="([^"]*)"/);
+				if (frameRateMatch) currentAdaptationSet.frameRate = frameRateMatch[1];
+			} else if (line.includes("<Representation")) {
+				currentRepresentation = {
+					id: null,
+					bandwidth: null,
+					width: null,
+					height: null,
+					frameRate: null,
+					codecs: null,
+					mimeType: null,
+				};
+
+				var idMatch = line.match(/id="?([^"\s]+)"?/);
+				if (idMatch) currentRepresentation.id = idMatch[1];
+
+				var bandwidthMatch2 = line.match(/bandwidth="?(\d+)?"?/);
+				if (bandwidthMatch2)
+					currentRepresentation.bandwidth = bandwidthMatch2[1]
+						? parseInt(bandwidthMatch2[1])
+						: null;
+
+				var widthMatch2 = line.match(/width="?(\d+)?"?/);
+				if (widthMatch2)
+					currentRepresentation.width = widthMatch2[1]
+						? parseInt(widthMatch2[1])
+						: null;
+
+				var heightMatch2 = line.match(/height="?(\d+)?"?/);
+				if (heightMatch2)
+					currentRepresentation.height = heightMatch2[1]
+						? parseInt(heightMatch2[1])
+						: null;
+
+				var codecsMatch2 = line.match(/codecs="([^"]*)"/);
+				if (codecsMatch2) currentRepresentation.codecs = codecsMatch2[1];
+
+				var mimeTypeMatch2 = line.match(/mimeType="([^"]*)"/);
+				if (mimeTypeMatch2) currentRepresentation.mimeType = mimeTypeMatch2[1];
+
+				if (currentAdaptationSet) {
+					currentAdaptationSet.representations.push(currentRepresentation);
+				}
+			} else if (line.includes("</Representation>")) {
+				currentRepresentation = null;
+			} else if (line.includes("</AdaptationSet>")) {
+				if (
+					currentAdaptationSet &&
+					currentAdaptationSet.representations.length > 0
+				) {
+					currentAdaptationSet.representations.forEach(function (rep) {
+						var quality = parseMpdRepresentationQuality(rep);
+						var mime = clean(
+							rep.mimeType || currentAdaptationSet.mimeType || "",
+						).toLowerCase();
+						var isVideo = mime.indexOf("video") !== -1;
+						var isAudio = mime.indexOf("audio") !== -1;
+
+						// Build source label with quality
+						var srcLabel = isVideo ? "Video" : "Audio";
+						if (quality > 0) {
+							srcLabel += " " + quality + "p";
+						} else if (rep.bandwidth > 0) {
+							srcLabel += " " + Math.round(rep.bandwidth / 1000) + "kbps";
+						}
+						if (isAudio && currentAdaptationSet.lang) {
+							srcLabel += " (" + currentAdaptationSet.lang + ")";
+						}
+
+						info.variants.push({
+							url: manifestUrl,
+							quality: quality,
+							source: srcLabel,
+							isVideo: isVideo,
+							isAudio: isAudio,
+							lang: currentAdaptationSet.lang || "",
+							bandwidth: rep.bandwidth || 0,
+							codecs: rep.codecs || currentAdaptationSet.codecs || "",
+						});
+					});
+				}
+				currentAdaptationSet = null;
+			}
+		});
+
+		// Sort variants: video by quality desc, audio after video
+		info.variants.sort(function (a, b) {
+			if (a.isVideo && !b.isVideo) return -1;
+			if (!a.isVideo && b.isVideo) return 1;
+			return b.quality - a.quality;
+		});
+
+		return info;
+	}
+
+	// ═══════════════════════════════════════════════════════════════════════════
+	// Stream Expansion (HLS + DASH quality extraction)
+	// ═══════════════════════════════════════════════════════════════════════════
+
+	/**
+	 * Fetch and expand an HLS master playlist into multiple quality streams
+	 */
+	async function expandHlsStreams(sourceLabel, url, headers) {
+		if (!url || !shouldExpandHlsVariants(url)) return [];
+
+		try {
+			var response = await fetchText(url, headers || {});
+			if (
+				extractResponseStatus(response) < 200 ||
+				extractResponseStatus(response) >= 300
+			)
+				return [];
+
+			var manifestText = extractResponseBody(response);
+			if (
+				!manifestText.startsWith("#EXTM3U") ||
+				manifestText.indexOf("#EXT-X-STREAM-INF") === -1
+			)
+				return [];
+
+			var manifestInfo = parseHlsMasterPlaylist(manifestText, url);
+			var variants =
+				manifestInfo && Array.isArray(manifestInfo.variants)
+					? manifestInfo.variants
+					: [];
+			var seen = {};
+			var streams = [];
+
+			variants.forEach(function (variant) {
+				if (!variant || !variant.url || seen[variant.url]) return;
+				seen[variant.url] = true;
+
+				var quality = parseVariantQuality(variant.attributes || {});
+				var label = sourceLabel;
+				if (quality > 0) {
+					label = sourceLabel + " " + quality + "p";
+				}
+
+				var stream = new StreamResult({
+					source: label,
+					url: variant.url,
+					headers: headers || {},
+				});
+				if (typeof quality === "number" && quality > 0) {
+					stream.quality = quality;
+				}
+				streams.push(stream);
+			});
+
+			return streams;
+		} catch (error) {
+			console.error("[CloudPlay] Failed to expand HLS streams:", error.message);
+			return [];
+		}
+	}
+
+	/**
+	 * Fetch and expand a DASH MPD manifest into multiple quality streams
+	 */
+	async function expandMpdStreams(sourceLabel, url, headers) {
+		if (!url || !isDashManifest(url)) return [];
+
+		try {
+			var response = await fetchText(url, headers || {});
+			if (
+				extractResponseStatus(response) < 200 ||
+				extractResponseStatus(response) >= 300
+			)
+				return [];
+
+			var manifestText = extractResponseBody(response);
+			if (!manifestText.startsWith("<?xml") && !manifestText.includes("<MPD"))
+				return [];
+
+			var manifestInfo = parseMpdMasterPlaylist(manifestText, url);
+			var variants =
+				manifestInfo && Array.isArray(manifestInfo.variants)
+					? manifestInfo.variants
+					: [];
+			if (variants.length === 0) return [];
+
+			var streams = [];
+
+			variants.forEach(function (variant) {
+				var label = sourceLabel + " - " + (variant.source || "Auto");
+				var stream = new StreamResult({
+					source: label,
+					url: variant.url,
+					headers: headers || {},
+				});
+				if (typeof variant.quality === "number" && variant.quality > 0) {
+					stream.quality = variant.quality;
+				}
+				streams.push(stream);
+			});
+
+			// If no variants had quality set, push at least one auto stream
+			if (streams.length === 0) {
+				var fallback = new StreamResult({
+					source: sourceLabel,
+					url: url,
+					headers: headers || {},
+				});
+				fallback.quality = 0;
+				streams.push(fallback);
+			}
+
+			return streams;
+		} catch (error) {
+			console.error("[CloudPlay] Failed to expand MPD streams:", error.message);
+			return [];
+		}
 	}
 
 	// ═══════════════════════════════════════════════════════════════════════════
@@ -768,6 +1119,7 @@
 			const ch = payload.channel;
 			const streamUrl = ch.url;
 			const headers = Object.assign({}, ch.headers || {});
+			const sourceLabel = ch.title || "CloudPlay";
 
 			if (!streamUrl) {
 				return cb({
@@ -777,67 +1129,58 @@
 				});
 			}
 
-			const streams = [];
+			let streams = [];
 
-			// Handle DASH (MPD) streams
+			// Try DASH (MPD) quality expansion first
 			if (isDashManifest(streamUrl)) {
-				const streamResult = new StreamResult({
-					url: streamUrl,
-					source: ch.title || "CloudPlay",
-					headers: headers,
-				});
-				streamResult.quality = 0;
-
-				if (ch.keyHex && ch.kidHex) {
-					streamResult.drmKey = ch.keyHex;
-					streamResult.drmKid = ch.kidHex;
-				} else if (ch.licenseUrl) {
-					streamResult.licenseUrl = ch.licenseUrl;
+				const expanded = await expandMpdStreams(
+					sourceLabel,
+					streamUrl,
+					headers,
+				);
+				if (expanded.length > 0) {
+					streams = expanded;
+				} else {
+					const fallback = new StreamResult({
+						url: streamUrl,
+						source: sourceLabel,
+						headers: headers,
+					});
+					fallback.quality = 0;
+					streams.push(fallback);
 				}
 
-				streams.push(streamResult);
+				// Apply DRM to all streams
+				streams.forEach(function (s) {
+					if (ch.keyHex && ch.kidHex) {
+						s.drmKey = ch.keyHex;
+						s.drmKid = ch.kidHex;
+					} else if (ch.licenseUrl) {
+						s.licenseUrl = ch.licenseUrl;
+					}
+				});
+
 				return cb({ success: true, data: streams });
 			}
 
-			// Handle HLS streams
-			if (isHlsMasterPlaylist(streamUrl)) {
-				try {
-					const response = await fetchText(streamUrl, headers);
-					const manifestText = extractResponseBody(response);
-
-					if (manifestText && manifestText.includes("#EXT-X-STREAM-INF:")) {
-						const variants = parseHlsMasterPlaylist(manifestText, streamUrl);
-
-						if (variants.length > 0) {
-							for (const variant of variants) {
-								const stream = new StreamResult({
-									url: variant.url,
-									source: ch.title || "CloudPlay",
-									headers: headers,
-								});
-								if (variant.quality > 0) {
-									stream.quality = variant.quality;
-								}
-								streams.push(stream);
-							}
-
-							return cb({ success: true, data: streams });
-						}
-					}
-				} catch (parseError) {
-					console.warn(
-						"[CloudPlay] Failed to parse HLS master playlist:",
-						parseError.message,
-					);
+			// Try HLS quality expansion
+			if (shouldExpandHlsVariants(streamUrl)) {
+				const expanded = await expandHlsStreams(
+					sourceLabel,
+					streamUrl,
+					headers,
+				);
+				if (expanded.length > 0) {
+					streams = expanded;
+				} else {
+					const fallback = new StreamResult({
+						url: streamUrl,
+						source: sourceLabel,
+						headers: headers,
+					});
+					fallback.quality = 0;
+					streams.push(fallback);
 				}
-
-				const fallbackStream = new StreamResult({
-					url: streamUrl,
-					source: ch.title || "CloudPlay",
-					headers: headers,
-				});
-				fallbackStream.quality = 0;
-				streams.push(fallbackStream);
 
 				return cb({ success: true, data: streams });
 			}
@@ -845,7 +1188,7 @@
 			// Handle direct video URLs (MP4, etc.)
 			const directStream = new StreamResult({
 				url: streamUrl,
-				source: ch.title || "CloudPlay",
+				source: sourceLabel,
 				headers: headers,
 			});
 			directStream.quality = 0;
