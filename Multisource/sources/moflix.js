@@ -9,9 +9,11 @@
 //            2. GET /api/v1/titles/{mediaId}/seasons/{s}/episodes/{e}?loader=episodePage
 // Playback:  GET /api/v1/{playback_resolve_url} → returns JSON { src }
 //
-// NOTE: The API requires a valid Referer header (moflix-stream.xyz).
-// Embed mirrors (vidara, veev, gupload) require JS rendering and are
-// skipped — we only return the direct HLS master stream.
+// M3U8 master playlists are parsed to extract individual quality variants
+// (e.g. 1080p, 720p, 480p). If only one variant exists, it's returned as-is.
+//
+// Embed mirrors (vidara, veev, gupload) are SKIPPED — they require
+// browser JS execution which is not available in QuickJS.
 
 var SOURCE_NAME = "moflix";
 var MAIN_URL = "https://moflix-stream.xyz";
@@ -52,7 +54,6 @@ function b64encode(str) {
 
 async function httpGet(url, headers) {
 	try {
-		// NOTE: Do NOT pass a 3rd argument — globalThis.http_get takes (url, headers) only
 		var raw = await globalThis.http_get(url, headers || {});
 		if (typeof raw === "string") return raw;
 		if (raw && raw.body) {
@@ -76,6 +77,88 @@ async function fetchJSON(url) {
 		return null;
 	}
 }
+
+// ─── M3U8 Master Playlist Parser ─────────────────────────────────────────
+// Parses an HLS master playlist to extract individual quality variants.
+// Returns an array of { url, resolution, bandwidth } objects.
+// Falls back to [{ url: originalUrl }] if parsing fails or no variants found.
+
+function resolveUrl(baseUrl, relativeUrl) {
+	if (!relativeUrl) return null;
+	if (
+		relativeUrl.indexOf("http://") === 0 ||
+		relativeUrl.indexOf("https://") === 0
+	)
+		return relativeUrl;
+	// Relative URL — resolve against base
+	var slashIdx = baseUrl.lastIndexOf("/");
+	if (slashIdx === -1) return baseUrl + "/" + relativeUrl;
+	return baseUrl.substring(0, slashIdx + 1) + relativeUrl;
+}
+
+function parseMasterPlaylist(content, baseUrl) {
+	if (!content || typeof content !== "string") return null;
+	if (content.indexOf("#EXTM3U") !== 0) return null;
+
+	var variants = [];
+	var lines = content.split("\n");
+	var currentInf = null;
+
+	for (var li = 0; li < lines.length; li++) {
+		var line = lines[li].trim();
+		if (!line) continue;
+
+		// Parse #EXT-X-STREAM-INF attributes
+		if (line.indexOf("#EXT-X-STREAM-INF:") === 0) {
+			var attrs = line.substring(18); // after "#EXT-X-STREAM-INF:"
+			var bandwidth = "";
+			var resolution = "";
+
+			// Extract RESOLUTION
+			var resMatch = attrs.match(/RESOLUTION=(\d+x\d+)/i);
+			if (resMatch) resolution = resMatch[1];
+
+			// Extract BANDWIDTH
+			var bwMatch = attrs.match(/BANDWIDTH=(\d+)/i);
+			if (bwMatch) bandwidth = bwMatch[1];
+
+			currentInf = { resolution: resolution, bandwidth: bandwidth };
+			continue;
+		}
+
+		// The next non-empty line after STREAM-INF is the media playlist URL
+		if (currentInf && line.indexOf("#") !== 0 && line.indexOf("<") !== 0) {
+			var variantUrl = resolveUrl(baseUrl, line);
+			if (variantUrl) {
+				variants.push({
+					url: variantUrl,
+					resolution: currentInf.resolution,
+					bandwidth: currentInf.bandwidth,
+				});
+			}
+			currentInf = null;
+		}
+	}
+
+	return variants.length > 0 ? variants : null;
+}
+
+// Map resolution string to human-readable quality label
+function resolutionToLabel(resolution) {
+	if (!resolution) return "";
+	var parts = resolution.split("x");
+	if (parts.length !== 2) return "";
+	var height = parseInt(parts[1], 10);
+	if (!height) return "";
+	if (height >= 2000) return "4K";
+	if (height >= 1000) return "1080p";
+	if (height >= 700) return "720p";
+	if (height >= 400) return "480p";
+	if (height >= 200) return "360p";
+	return height + "p";
+}
+
+// ─── Main Scraper ────────────────────────────────────────────────────────
 
 async function scrapeStreams(params) {
 	var start = Date.now();
@@ -175,25 +258,47 @@ async function scrapeStreams(params) {
 			if (!finalSrc || seenUrls[finalSrc]) continue;
 			seenUrls[finalSrc] = true;
 
-			// Only return the direct M3U8 stream — embed mirrors require JS rendering
-			if (
-				finalSrc.indexOf(".m3u8") !== -1 ||
-				finalSrc.indexOf(".m3u?") !== -1
-			) {
-				var q = quality || "Auto";
-				streams.push({
-					url: finalSrc,
-					quality: q,
-					headers: { "User-Agent": UA, Referer: MAIN_URL + "/" },
-				});
-			} else if (finalSrc.indexOf(".mp4") !== -1) {
-				streams.push({
-					url: finalSrc,
-					quality: quality || "Auto",
-					headers: { "User-Agent": UA, Referer: MAIN_URL + "/" },
-				});
-			}
 			// Skip embed URLs — they require browser JS execution
+			if (
+				finalSrc.indexOf(".m3u8") === -1 &&
+				finalSrc.indexOf(".m3u?") === -1 &&
+				finalSrc.indexOf(".mp4") === -1
+			)
+				continue;
+
+			// Fetch the master M3U8 playlist and parse individual quality variants
+			var masterContent = await httpGet(finalSrc, {
+				"User-Agent": UA,
+				Referer: MAIN_URL + "/",
+			});
+
+			if (masterContent && masterContent.indexOf("#EXTM3U") === 0) {
+				var parsed = parseMasterPlaylist(masterContent, finalSrc);
+				if (parsed && parsed.length > 0) {
+					for (var pi = 0; pi < parsed.length; pi++) {
+						var variant = parsed[pi];
+						if (seenUrls[variant.url]) continue;
+						seenUrls[variant.url] = true;
+
+						var label =
+							resolutionToLabel(variant.resolution) || quality || "Auto";
+						streams.push({
+							url: variant.url,
+							quality: label,
+							headers: { "User-Agent": UA, Referer: MAIN_URL + "/" },
+						});
+					}
+					continue; // processed via variants, skip the direct push below
+				}
+			}
+
+			// Fallback: if M3U8 parsing failed or no variants, push the original URL
+			var q = quality || "Auto";
+			streams.push({
+				url: finalSrc,
+				quality: q,
+				headers: { "User-Agent": UA, Referer: MAIN_URL + "/" },
+			});
 		}
 
 		if (streams.length === 0) {
