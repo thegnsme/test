@@ -1,16 +1,10 @@
 {
-  "packageName": "com.multisource.streams.multisource",
-  "name": "MultiSource",
-  "version": 1,
-  "baseUrl": "https://example.com",
-  "description": "MultiSource plugin (Sky Gen 2)",
-  "authors": [
-    "MultiSource Team"
-  ],
-  "languages": [
-    "en"
-  ],
-  "categories": [
-    "Others"
-  ]
+	"packageName": "com.multisource.streams.multisource",
+	"name": "MultiSource",
+	"version": 2,
+	"baseUrl": "https://example.com",
+	"description": "MultiSource Plugin v2 — 12 streaming sources aggregated via TMDB with subtitle enrichment",
+	"authors": ["MultiSource Team"],
+	"languages": ["en"],
+	"categories": ["Streaming", "Movies", "TV", "Anime"]
 }

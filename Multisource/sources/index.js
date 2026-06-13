@@ -32,6 +32,8 @@ var _sourceEntries = [
 	["vidlink_pro", require("./vidlink_pro")],
 	["vidsrc", require("./vidsrc")],
 	["vixsrc", require("./vixsrc")],
+	["primesrc", require("./primesrc")],
+	["moflix", require("./moflix")],
 ];
 
 // ─── Build Module Registry ────────────────────────────────────────────
