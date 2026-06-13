@@ -326,8 +326,39 @@ async function trySingleServer(server, params) {
 }
 
 /**
- * Fetch encrypted sources from ALL servers in parallel.
- * Returns an array of successful { name, text } objects (0 to 4).
+ * Race a list of promises and return results from the first N that fulfill
+ * with a truthy value matching the filter predicate. Stops waiting once the
+ * target count is reached or all promises resolve/reject.
+ *
+ * @param {Array<Promise>} promises - Array of tagged promises
+ * @param {number} maxResults - Stop after collecting this many valid results
+ * @param {Function} filter - Predicate to determine valid results
+ * @returns {Promise<Array>} Array of valid results (0 to maxResults)
+ */
+async function raceToN(promises, maxResults, filter) {
+  var results = [];
+  var pending = promises.slice();
+
+  while (pending.length > 0 && results.length < maxResults) {
+    var winner = await Promise.race(
+      pending.map(function (p, idx) {
+        return p.then(function (v) {
+          return { index: idx, value: v };
+        });
+      }),
+    );
+    pending.splice(winner.index, 1);
+    if (filter(winner.value)) {
+      results.push(winner.value);
+    }
+  }
+  return results;
+}
+
+/**
+ * Fetch encrypted sources from ALL servers in PARALLEL.
+ * Uses a "race to first 2" pattern: returns as soon as 2 servers respond,
+ * without waiting for the rest to time out.
  *
  * @param {Object} params - Content parameters with title, type, year, tmdbId, etc.
  * @returns {Promise<Array<{name:string, text:string}>>}
@@ -341,30 +372,25 @@ async function tryAllServers(params) {
     promises.push(trySingleServer(server, params));
   }
 
-  // Fire all servers in parallel
-  var settled = await Promise.allSettled(promises);
+  if (promises.length === 0) return [];
 
-  var results = [];
-  for (var ri = 0; ri < settled.length; ri++) {
-    var s = settled[ri];
-    if (
-      s.status === "fulfilled" &&
-      s.value &&
-      s.value.text &&
-      s.value.text.length >= 10
-    ) {
-      results.push(s.value);
-      console.log(
-        "[VidKing] " +
-          s.value.name +
-          " responded (" +
-          s.value.text.length +
-          " chars)",
-      );
-    }
+  // Race to first 2 successful responses
+  var results = await raceToN(promises, 2, function (v) {
+    return v && v.text && v.text.length >= 10;
+  });
+
+  // Log results
+  for (var ri = 0; ri < results.length; ri++) {
+    console.log(
+      "[VidKing] " +
+        results[ri].name +
+        " responded (" +
+        results[ri].text.length +
+        " chars)",
+    );
   }
 
-  // Log which servers failed
+  // Log which servers didn't contribute (best-effort)
   var successNames = results.map(function (r) {
     return r.name;
   });
@@ -410,7 +436,8 @@ async function decryptSingleResponse(encryptedText, tmdbId, serverName) {
 }
 
 /**
- * Decrypt multiple server responses in parallel.
+ * Decrypt multiple server responses IN PARALLEL.
+ * Uses "race to first 2" pattern so we don't wait for slow/failing decrypts.
  *
  * @param {Array<{name:string, text:string}>} serverResponses - Output from tryAllServers
  * @param {number|string} tmdbId
@@ -426,15 +453,13 @@ async function decryptAllResponses(serverResponses, tmdbId) {
     decryptPromises.push(decryptSingleResponse(sr.text, tmdbId, sr.name));
   }
 
-  var decrypted = await Promise.allSettled(decryptPromises);
+  // Race to first 2 successful decryptions
+  var results = await raceToN(decryptPromises, 2, function (v) {
+    return v && v.result;
+  });
 
-  var results = [];
-  for (var ri = 0; ri < decrypted.length; ri++) {
-    var d = decrypted[ri];
-    if (d.status === "fulfilled" && d.value && d.value.result) {
-      results.push(d.value);
-      console.log("[VidKing] " + d.value.name + " decrypted successfully");
-    }
+  for (var ri = 0; ri < results.length; ri++) {
+    console.log("[VidKing] " + results[ri].name + " decrypted successfully");
   }
 
   return results;
@@ -969,53 +994,43 @@ function embedPageUrl(tmdbId, type, season, episode) {
 }
 
 /**
- * Shared embed-fallback helper: tries extractFromEmbedPage, then falls back
- * to a raw embed-URL stream as a last resort.
+ * Shared embed-fallback helper: tries extractFromEmbedPage only.
+ * DOES NOT return the raw embed URL — that's an HTML page, not a
+ * playable video stream. If extraction fails, returns null.
  *
- * @returns {Object|null} A source result object, or null if both fail.
+ * @returns {Object|null} A source result object with M3U8 streams, or null.
  */
 async function tryEmbedFallback(tmdbId, type, season, episode, start) {
   var embedResult = await extractFromEmbedPage(tmdbId, type, season, episode);
   if (embedResult) {
     embedResult.latency_ms = Date.now() - start;
+    console.log(
+      "[VidKing] ✓ embed extraction: " +
+        embedResult.streams.length +
+        " streams (" +
+        embedResult.latency_ms +
+        "ms)",
+    );
     return embedResult;
   }
-  // Last resort: return the embed URL itself as a playable stream
-  try {
-    var embedUrl = embedPageUrl(tmdbId, type, season, episode);
-    return {
-      source: SOURCE_NAME,
-      status: "working",
-      streams: [
-        {
-          url: embedUrl,
-          quality: "Auto",
-          headers: {
-            "User-Agent": UA,
-            Referer: VIDKING_BASE + "/",
-          },
-        },
-      ],
-      latency_ms: Date.now() - start,
-    };
-  } catch (_) {
-    return null;
-  }
+  console.log("[VidKing] ✗ embed extraction: no M3U8 streams found");
+  return null;
 }
 
 // ─── Main Scrape Function ───────────────────────────────────────────────────
 
+var TOTAL_SCRAPE_TIMEOUT = 30000;
+
 /**
  * Scrape streams from vidking.net for the given content.
  *
- * Architecture:
- *   1. Fetch TMDB metadata for title/year/imdb_id (cached)
- *   2. Fire ALL 4 API servers in parallel via Promise.allSettled
- *   3. Decrypt ALL successful server responses in parallel
- *   4. Merge/dedup streams from all servers with source attribution
- *   5. Expand M3U8 master playlists into multi-quality variants
- *   6. Sort by quality descending
- *   7. Fallback to embed page if all servers fail
+ * Architecture (parallel):
+ *   1. Launch embed page extraction IMMEDIATELY (fast, http_get only)
+ *   2. Simultaneously fetch TMDB metadata, then fire ALL 4 API servers
+ *      in parallel, decrypt responses in parallel, merge streams
+ *   3. Race both approaches — first one with usable streams wins
+ *   4. Never return raw embed URLs (HTML pages are not playable video)
+ *   5. Hard cap at TOTAL_SCRAPE_TIMEOUT to prevent blocking the UI
  *
  * @param {Object} params - The parameters object
  * @param {number} params.tmdbId - TMDB ID of the content
@@ -1030,7 +1045,7 @@ async function scrapeStreams(params) {
     return makeFail(SOURCE_NAME, "invalid parameters: expected object", start);
   }
   var tmdbId = params.tmdbId;
-  var type = params.type;
+  var type = params.type || "movie";
   var season = params.season || 1;
   var episode = params.episode || 1;
 
@@ -1038,108 +1053,133 @@ async function scrapeStreams(params) {
     return makeFail(SOURCE_NAME, "no tmdbId provided", start);
   }
 
-  // ── Shared fallback helper for all failure paths ──
-  async function fallback(errMsg) {
-    console.log("[VidKing] " + errMsg + ", trying embed fallback");
-    var fb = await tryEmbedFallback(tmdbId, type, season, episode, start);
-    if (fb) return fb;
-    return makeFail(SOURCE_NAME, errMsg, start);
-  }
-
+  // ── Hard timeout guard ──
   try {
-    // ── Step 1: Fetch TMDB metadata ──
-    var meta = await fetchTmdbMeta(tmdbId, type);
-    if (!meta || !meta.title) {
-      return await fallback("TMDB metadata required");
-    }
-
-    // Log metadata for debugging
-    console.log(
-      "[VidKing] " +
-        meta.title +
-        " (" +
-        (meta.year || "N/A") +
-        ") imdb:" +
-        (meta.imdb_id || "N/A") +
-        " tmdb:" +
-        tmdbId +
-        " " +
-        type +
-        (type === "tv" ? " S" + season + "E" + episode : ""),
+    return await withTimeout(
+      scrapeStreamsInner(tmdbId, type, season, episode, start),
+      TOTAL_SCRAPE_TIMEOUT,
+      "total scrape",
     );
-
-    // ── Step 2: Fetch ALL servers in PARALLEL ──
-    var apiParams = {
-      title: meta.title,
-      type: type,
-      year: meta.year,
-      tmdbId: tmdbId,
-      imdbId: meta.imdb_id || "",
-      season: season,
-      episode: episode,
-    };
-
-    var serverResponses = await tryAllServers(apiParams);
-
-    if (serverResponses.length === 0) {
-      return await fallback("all 4 API servers failed");
-    }
-
-    // ── Step 3: Decrypt ALL responses in PARALLEL ──
-    var decryptedResults = await decryptAllResponses(serverResponses, tmdbId);
-
-    if (decryptedResults.length === 0) {
-      return await fallback("all server responses failed decryption");
-    }
-
-    // ── Step 4: Merge streams from ALL servers (with dedup) ──
-    var streams = await mergeServerResults(decryptedResults);
-
-    // ── Step 5: Sort by quality descending ──
-    streams.sort(function (a, b) {
-      return qualityRank(b.quality) - qualityRank(a.quality);
-    });
-
-    if (streams.length === 0) {
-      return await fallback("no valid stream URLs from any server");
-    }
-
-    // ── Log summary ──
-    var serverSummary = decryptedResults
-      .map(function (d) {
-        return d.name;
-      })
-      .join(", ");
-    var totalSubs = 0;
-    for (var si = 0; si < streams.length; si++) {
-      if (streams[si].subtitles) totalSubs += streams[si].subtitles.length;
-    }
-
-    console.log(
-      "[VidKing] ✓ " +
-        streams.length +
-        " streams from " +
-        serverSummary +
-        " (" +
-        (Date.now() - start) +
-        "ms)" +
-        (totalSubs > 0 ? " + ~" + totalSubs + " subtitle tracks" : ""),
-    );
-
-    return {
-      source: SOURCE_NAME,
-      status: "working",
-      streams: streams,
-      latency_ms: Date.now() - start,
-    };
   } catch (e) {
     console.log(
-      "[VidKing] Error: " + (e && e.message) + ", trying embed fallback",
+      "[VidKing] Total timeout (" +
+        TOTAL_SCRAPE_TIMEOUT +
+        "ms), returning no_streams: " +
+        (e && e.message),
     );
-    var fb = await tryEmbedFallback(tmdbId, type, season, episode, start);
-    if (fb) return fb;
-    return makeFail(SOURCE_NAME, e && e.message, start);
+    return makeFail(SOURCE_NAME, "total timeout", start);
   }
+}
+
+/**
+ * Inner scrape logic — two approaches race in parallel.
+ *
+ * Approach A: Embed page extraction (fast, 2-8s, only needs http_get)
+ * Approach B: API pipeline (slow, 12-25s, needs TMDB + http_post for decrypt)
+ */
+async function scrapeStreamsInner(tmdbId, type, season, episode, start) {
+  // Log content being resolved
+  console.log(
+    "[VidKing] Resolving tmdb:" +
+      tmdbId +
+      " " +
+      type +
+      (type === "tv" ? " S" + season + "E" + episode : "") +
+      "...",
+  );
+
+  // ── Approach A: Embed page extraction (starts immediately) ──
+  var embedPromise = tryEmbedFallback(tmdbId, type, season, episode, start);
+
+  // ── Approach B: Full API pipeline ──
+  var apiPromise = (async function () {
+    try {
+      // TMDB metadata is optional — if it fails, we still try the API
+      // with just the tmdbId (the API might resolve title/year internally)
+      var meta = await fetchTmdbMeta(tmdbId, type);
+
+      if (meta && meta.title) {
+        console.log(
+          "[VidKing] " +
+            meta.title +
+            " (" +
+            (meta.year || "N/A") +
+            ") imdb:" +
+            (meta.imdb_id || "N/A") +
+            " tmdb:" +
+            tmdbId +
+            (type === "tv" ? " S" + season + "E" + episode : ""),
+        );
+      } else {
+        console.log("[VidKing] TMDB metadata unavailable, using tmdbId only");
+      }
+
+      var apiParams = {
+        title: (meta && meta.title) || "",
+        type: type,
+        year: (meta && meta.year) || "",
+        tmdbId: tmdbId,
+        imdbId: (meta && meta.imdb_id) || "",
+        season: season,
+        episode: episode,
+      };
+
+      var serverResponses = await tryAllServers(apiParams);
+      if (serverResponses.length === 0) return null;
+
+      var decryptedResults = await decryptAllResponses(serverResponses, tmdbId);
+      if (decryptedResults.length === 0) return null;
+
+      var streams = await mergeServerResults(decryptedResults);
+      if (streams.length === 0) return null;
+
+      streams.sort(function (a, b) {
+        return qualityRank(b.quality) - qualityRank(a.quality);
+      });
+
+      return {
+        source: SOURCE_NAME,
+        status: "working",
+        streams: streams,
+        latency_ms: Date.now() - start,
+      };
+    } catch (e) {
+      console.log("[VidKing] API approach failed: " + (e && e.message));
+      return null;
+    }
+  })();
+
+  // ── Race both approaches ──
+  // Wrap each in a tagged promise so we know which finished first
+  var embedTagged = embedPromise.then(function (r) {
+    return { tag: "embed", result: r };
+  });
+  var apiTagged = apiPromise.then(function (r) {
+    return { tag: "api", result: r };
+  });
+
+  var first = await Promise.race([embedTagged, apiTagged]);
+
+  if (first.result && first.result.streams && first.result.streams.length > 0) {
+    // Ensure latency_ms is accurate
+    first.result.latency_ms = Date.now() - start;
+    return first.result;
+  }
+
+  // First approach had no streams — wait for the other
+  var second = first.tag === "embed" ? await apiPromise : await embedPromise;
+
+  if (second && second.streams && second.streams.length > 0) {
+    second.latency_ms = Date.now() - start;
+    return second;
+  }
+
+  // Both failed — declare defeat
+  return makeFail(
+    SOURCE_NAME,
+    "all approaches failed (" + (Date.now() - start) + "ms)",
+    start,
+  );
 }
 
 // ─── Module Exports ─────────────────────────────────────────────────────────
