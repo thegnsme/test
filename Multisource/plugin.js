@@ -777,6 +777,9 @@
 					streamObj.subtitles = s.subtitles;
 				}
 
+				// Preserve audio track info (dub)
+				if (s.dub) streamObj.dub = s.dub;
+
 				streamObj._qr = qualityRank(streamObj.quality || q);
 				allStreams.push(streamObj);
 			}
