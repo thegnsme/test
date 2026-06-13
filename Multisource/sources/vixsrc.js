@@ -139,11 +139,13 @@ function parseMasterPlaylist(text, baseReferer) {
       var langMatch = line.match(/LANGUAGE="([^"]+)"/);
       var nameMatch = line.match(/NAME="([^"]+)"/);
       var uriMatch = line.match(/URI="([^"]+)"/);
+      var defaultMatch = line.match(/DEFAULT=([A-Z]+)/);
       if (uriMatch && uriMatch[1]) {
         subtitles.push({
           url: uriMatch[1],
           lang: langMatch && langMatch[1] ? langMatch[1] : "Unknown",
           label: nameMatch && nameMatch[1] ? nameMatch[1] : "Unknown",
+          default: defaultMatch && defaultMatch[1] === "YES",
         });
       }
     }
@@ -151,10 +153,14 @@ function parseMasterPlaylist(text, baseReferer) {
     if (line.indexOf("#EXT-X-MEDIA:TYPE=AUDIO") !== -1) {
       var langMatch = line.match(/LANGUAGE="([^"]+)"/);
       var nameMatch = line.match(/NAME="([^"]+)"/);
+      var uriMatch = line.match(/URI="([^"]+)"/);
+      var defaultMatch = line.match(/DEFAULT=([A-Z]+)/);
       if (nameMatch && nameMatch[1]) {
         audioTracks.push({
+          url: uriMatch && uriMatch[1] ? uriMatch[1] : "",
           lang: langMatch && langMatch[1] ? langMatch[1] : "",
           label: nameMatch[1],
+          default: defaultMatch && defaultMatch[1] === "YES",
         });
       }
     }
@@ -328,22 +334,44 @@ async function scrapeStreams(opts) {
     var playlistText = await fetchPlaylist(playlistUrl, embedUrl, 2);
     var parsed = parseMasterPlaylist(playlistText, embedUrl);
 
-    var maxLabel = "Auto";
-    if (parsed.qualities.length > 0) {
-      maxLabel = parsed.maxLabel || "Auto";
-    }
+    var ts = Date.now();
+    var streams = [];
 
-    var streams = [
-      {
-        url: playlistUrl,
+    if (parsed.qualities.length > 0) {
+      for (var qi = 0; qi < parsed.qualities.length; qi++) {
+        var q = parsed.qualities[qi];
+        var vUrl = playlistUrl + "#" + q.label + "-" + ts;
+        var entry = {
+          url: vUrl,
+          source: SOURCE_NAME,
+          quality: q.label,
+          headers: {
+            "User-Agent": UA,
+            Referer: embedUrl,
+          },
+        };
+        if (parsed.subtitles.length > 0) {
+          entry.subtitles = parsed.subtitles;
+        }
+        if (parsed.audioTracks.length > 0) {
+          entry.audio = parsed.audioTracks;
+        }
+        streams.push(entry);
+      }
+    } else {
+      var fallbackUrl = playlistUrl + "#auto-" + ts;
+      streams.push({
+        url: fallbackUrl,
         source: SOURCE_NAME,
-        quality: maxLabel,
+        quality: "Auto",
         headers: {
           "User-Agent": UA,
           Referer: embedUrl,
         },
-      },
-    ];
+        subtitles: parsed.subtitles.length > 0 ? parsed.subtitles : undefined,
+        audio: parsed.audioTracks.length > 0 ? parsed.audioTracks : undefined,
+      });
+    }
 
     return {
       source: SOURCE_NAME,
