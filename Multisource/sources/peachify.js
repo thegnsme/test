@@ -594,18 +594,13 @@ function parsePeachifySource(raw, serverLabel) {
 	}
 	if (!quality) quality = extractQualityFromUrl(url);
 
+	// 🚨 DO NOT copy raw.headers from the API response!
+	// Those headers (origin, referer, user-agent) are for the BACKEND CDN
+	// request through the Cloudflare Worker proxy. They're already encoded
+	// in the URL's &headers= parameter.
+	// The player should NOT send them — they cause the Worker to return 403.
 	var headers = {};
-	if (raw.headers && typeof raw.headers === "object") {
-		for (var k in raw.headers) {
-			if (
-				Object.prototype.hasOwnProperty.call(raw.headers, k) &&
-				raw.headers[k] != null
-			)
-				headers[k] = String(raw.headers[k]);
-		}
-	}
-	if (!headers["Referer"] && !headers["referer"])
-		headers["Referer"] = "https://peachify.top/";
+	headers["Referer"] = "https://peachify.top/";
 
 	return {
 		url: url,
@@ -613,7 +608,6 @@ function parsePeachifySource(raw, serverLabel) {
 		source: SOURCE_NAME + " [" + serverLabel + "]",
 		dub: dub,
 		headers: headers,
-		_serverLabel: serverLabel,
 	};
 }
 
