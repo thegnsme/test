@@ -396,453 +396,156 @@
 	}
 
 	// ═══════════════════════════════════════════════════════════════════════════
-	// HLS Master Playlist Parser (Quality Selection + Audio Groups)
+	// DRM Helpers
 	// ═══════════════════════════════════════════════════════════════════════════
 
-	function parseHlsAttributes(line) {
-		const attributes = {};
-		const regex = /([A-Z0-9-]+)=("[^"]*"|[^,]*)/g;
-		let match;
-		while ((match = regex.exec(String(line || ""))) !== null) {
-			const key = clean(match[1]).toUpperCase();
-			const value = clean(match[2]).replace(/^"|"$/g, "");
-			if (key) attributes[key] = value;
-		}
-		return attributes;
+	/**
+	 * Normalize any DRM identifier to lowercase hex
+	 * Accepts: hex with dashes, pure hex, or base64url
+	 */
+	function normalizeDrmHex(v) {
+		const s = clean(v);
+		if (!s || s.toLowerCase() === "null") return null;
+		const hex = s.replace(/-/g, "");
+		if (/^[0-9a-fA-F]+$/.test(hex) && hex.length % 2 === 0)
+			return hex.toLowerCase();
+		return base64ToHex(s);
 	}
 
-	function resolveVariantUrl(baseUrl, variantPath) {
-		const target = clean(variantPath);
-		if (!target) return "";
+	function base64ToHex(str) {
+		if (!str) return null;
 		try {
-			const resolved = new URL(target, baseUrl);
-			const base = new URL(baseUrl);
-			if (!resolved.search && !target.includes("?") && base.search) {
-				resolved.search = base.search;
+			const s = clean(str).replace(/-/g, "+").replace(/_/g, "/");
+			const p = s + "=".repeat((4 - (s.length % 4)) % 4);
+			const raw = atob(p);
+			var hex = "";
+			for (let i = 0; i < raw.length; i++) {
+				var h = raw.charCodeAt(i).toString(16);
+				hex += h.length === 2 ? h : "0" + h;
 			}
-			return resolved.toString();
+			return hex.toLowerCase();
 		} catch (_) {
-			return target;
+			return null;
 		}
 	}
 
-	function parseVariantQuality(attributes) {
-		if (!attributes || typeof attributes !== "object") return 0;
-		const resolution = clean(attributes.RESOLUTION);
-		const resolutionMatch = /(\d+)\s*x\s*(\d+)/i.exec(resolution);
-		if (resolutionMatch) return parseInt(resolutionMatch[2], 10) || 0;
-
-		const bandwidth = parseInt(
-			attributes["AVERAGE-BANDWIDTH"] || attributes.BANDWIDTH || "0",
-			10,
-		);
-		if (!bandwidth || bandwidth < 1) return 0;
-		if (bandwidth >= 20000000) return 2160;
-		if (bandwidth >= 10000000) return 1080;
-		if (bandwidth >= 6000000) return 720;
-		if (bandwidth >= 3000000) return 480;
-		if (bandwidth >= 1500000) return 360;
-		if (bandwidth >= 800000) return 240;
-		if (bandwidth >= 400000) return 144;
-		return 0;
+	function hexToBase64Url(hex) {
+		if (!hex) return null;
+		try {
+			const normalized = clean(hex).replace(/-/g, "");
+			var raw = "";
+			for (let i = 0; i < normalized.length; i += 2)
+				raw += String.fromCharCode(parseInt(normalized.substr(i, 2), 16));
+			return btoa(raw)
+				.replace(/\+/g, "-")
+				.replace(/\//g, "_")
+				.replace(/=+$/, "");
+		} catch (_) {
+			return null;
+		}
 	}
 
 	/**
-	 * Parse HLS master playlist into variants and media groups
-	 * Returns { variants: [{url, attributes}], mediaGroups: {AUDIO: {groupId: [{uri, language, name}]}} }
+	 * Parse key/kid from a license URL like:
+	 *   https://dummy.com/?keyid=KID_HEX&key=KEY_HEX
+	 * Returns { keyHex, kidHex } or null
 	 */
-	function parseHlsMasterPlaylist(manifestText, manifestUrl) {
-		const info = {
-			variants: [],
-			version: "",
-			independentSegments: false,
-			mediaGroups: {
-				AUDIO: {},
-				SUBTITLES: {},
-				"CLOSED-CAPTIONS": {},
-			},
-		};
-		const lines = String(manifestText || "").split(/\r?\n/);
-		let pendingAttributes = null;
-
-		lines.forEach(function (rawLine) {
-			const line = rawLine.trim();
-			if (!line) return;
-
-			if (line.startsWith("#EXT-X-VERSION:")) {
-				info.version = clean(line.slice("#EXT-X-VERSION:".length));
-				return;
-			}
-
-			if (line === "#EXT-X-INDEPENDENT-SEGMENTS") {
-				info.independentSegments = true;
-				return;
-			}
-
-			if (line.startsWith("#EXT-X-MEDIA:")) {
-				const attributes = parseHlsAttributes(
-					line.slice("#EXT-X-MEDIA:".length),
-				);
-				const mediaType = clean(attributes.TYPE).toUpperCase();
-				const groupId = clean(attributes["GROUP-ID"]);
-				if (!mediaType || !groupId) return;
-				if (attributes.URI) {
-					attributes.URI = resolveVariantUrl(manifestUrl, attributes.URI);
-				}
-				if (!info.mediaGroups[mediaType]) info.mediaGroups[mediaType] = {};
-				if (!info.mediaGroups[mediaType][groupId])
-					info.mediaGroups[mediaType][groupId] = [];
-				info.mediaGroups[mediaType][groupId].push(attributes);
-				return;
-			}
-
-			if (line.startsWith("#EXT-X-STREAM-INF:")) {
-				pendingAttributes = parseHlsAttributes(
-					line.slice("#EXT-X-STREAM-INF:".length),
-				);
-				return;
-			}
-
-			if (line.startsWith("#")) return;
-
-			if (pendingAttributes) {
-				const resolved = resolveVariantUrl(manifestUrl, line);
-				if (resolved) {
-					info.variants.push({
-						url: resolved,
-						attributes: pendingAttributes,
-					});
-				}
-				pendingAttributes = null;
-			}
-		});
-
-		return info;
+	function parseKeyIdFromLicenseUrl(licenseUrl) {
+		const url = clean(licenseUrl);
+		if (!url) return null;
+		const kidMatch = url.match(/[?&]keyid=([^&]+)/i);
+		const keyMatch = url.match(/[?&]key=([^&]+)/i);
+		if (kidMatch && keyMatch) {
+			const kidHex = normalizeDrmHex(decodeURIComponent(kidMatch[1]));
+			const keyHex = normalizeDrmHex(decodeURIComponent(keyMatch[1]));
+			if (kidHex && keyHex) return { keyHex: keyHex, kidHex: kidHex };
+		}
+		return null;
 	}
 
-	function shouldExpandHlsVariants(url) {
-		const value = clean(url).toLowerCase();
-		if (!value || /\.mpd(?:$|[?#])/i.test(value)) return false;
-		return (
-			/\.m3u8(?:$|[?#])/i.test(value) ||
-			value.includes("/hls/") ||
-			value.includes("m3u8")
-		);
+	/**
+	 * Resolve ClearKey from a license server URL
+	 * 1. Fetch MPD manifest to extract cenc:default_KID
+	 * 2. Call license server with the KID (base64url)
+	 * 3. Return key in hex
+	 */
+	async function resolveClearKey(mpdUrl, licenseUrl, mpdHeaders) {
+		try {
+			const response = await fetchText(mpdUrl, mpdHeaders || {});
+			if (
+				extractResponseStatus(response) < 200 ||
+				extractResponseStatus(response) >= 300
+			)
+				return null;
+
+			const body = extractResponseBody(response);
+			const kidMatch = body.match(/cenc:default_KID=["']([^"']+)["']/i);
+			if (!kidMatch) return null;
+
+			const kidHex = kidMatch[1].replace(/-/g, "").toLowerCase();
+			const kidB64 = hexToBase64Url(kidHex);
+			if (!kidB64) return null;
+
+			const lRes = await postJson(
+				licenseUrl,
+				{ kids: [kidB64], type: "temporary" },
+				{
+					"User-Agent": "Dalvik/2.1.0 (Linux; U; Android)",
+					"Content-Type": "application/json;charset=UTF-8",
+				},
+			);
+
+			const lData = parseJsonSafe(extractResponseBody(lRes), {});
+			const keys = Array.isArray(lData.keys) ? lData.keys : [];
+			if (keys.length > 0 && keys[0].k) {
+				const keyHex = base64ToHex(keys[0].k);
+				if (keyHex) {
+					return {
+						drmKey: keyHex,
+						drmKid: kidHex,
+						licenseUrl: licenseUrl,
+					};
+				}
+			}
+		} catch (_) {}
+		return null;
 	}
 
-	function isHlsMasterPlaylist(url) {
-		const lower = clean(url).toLowerCase();
-		return (
-			lower.includes(".m3u8") &&
-			!lower.includes("segment") &&
-			!lower.includes(".ts")
-		);
+	/**
+	 * POST JSON helper (for license server calls)
+	 */
+	async function postJson(url, payload, headers) {
+		if (!url || typeof url !== "string") {
+			throw new Error("Invalid URL for postJson");
+		}
+		if (!payload || typeof payload !== "object") {
+			throw new Error("Invalid payload for postJson");
+		}
+		const body = JSON.stringify(payload);
+		try {
+			if (typeof http_post === "function") {
+				return http_post(url, headers || {}, body);
+			}
+			if (typeof fetch === "function") {
+				const response = await fetch(url, {
+					method: "POST",
+					headers: headers || {},
+					body: body,
+				});
+				return {
+					status: response.status,
+					body: await response.text(),
+				};
+			}
+			throw new Error("POST requests are not supported in this runtime");
+		} catch (error) {
+			console.error("Failed to POST to " + url + ": " + error.message);
+			throw error;
+		}
 	}
 
 	function isDashManifest(url) {
 		return clean(url).toLowerCase().includes(".mpd");
-	}
-
-	// ═══════════════════════════════════════════════════════════════════════════
-	// DASH MPD Manifest Parser (Quality Selection)
-	// ═══════════════════════════════════════════════════════════════════════════
-
-	function parseMpdRepresentationQuality(representation) {
-		if (!representation || typeof representation !== "object") return 0;
-		const resolution = representation.height;
-		if (resolution && resolution > 0) {
-			if (resolution >= 4320) return 4320;
-			if (resolution >= 2160) return 2160;
-			if (resolution >= 1080) return 1080;
-			if (resolution >= 720) return 720;
-			if (resolution >= 480) return 480;
-			if (resolution >= 360) return 360;
-			if (resolution >= 240) return 240;
-			if (resolution >= 144) return 144;
-		}
-		const bandwidth = representation.bandwidth;
-		if (bandwidth && bandwidth > 0) {
-			if (bandwidth >= 20000000) return 2160;
-			if (bandwidth >= 10000000) return 1080;
-			if (bandwidth >= 6000000) return 720;
-			if (bandwidth >= 3000000) return 480;
-			if (bandwidth >= 1500000) return 360;
-			if (bandwidth >= 800000) return 240;
-			if (bandwidth >= 400000) return 144;
-		}
-		return 0;
-	}
-
-	function parseMpdMasterPlaylist(manifestText, manifestUrl) {
-		const info = {
-			variants: [],
-			version: "",
-			mediaGroups: {
-				AUDIO: [],
-				VIDEO: [],
-			},
-		};
-		const lines = String(manifestText || "").split(/\r?\n/);
-		let currentAdaptationSet = null;
-		let currentRepresentation = null;
-
-		lines.forEach(function (rawLine) {
-			const line = rawLine.trim();
-			if (!line) return;
-
-			if (line.includes("<AdaptationSet")) {
-				currentAdaptationSet = {
-					id: null,
-					mimeType: null,
-					codecs: null,
-					bandwidth: null,
-					width: null,
-					height: null,
-					frameRate: null,
-					audioSamplingRate: null,
-					lang: null,
-					representations: [],
-				};
-
-				var mimeTypeMatch = line.match(/mimeType="([^"]*)"/);
-				if (mimeTypeMatch) currentAdaptationSet.mimeType = mimeTypeMatch[1];
-
-				var codecsMatch = line.match(/codecs="([^"]*)"/);
-				if (codecsMatch) currentAdaptationSet.codecs = codecsMatch[1];
-
-				var langMatch = line.match(/lang="([^"]*)"/);
-				if (langMatch) currentAdaptationSet.lang = langMatch[1];
-
-				var bandwidthMatch = line.match(/bandwidth="?(\d+)?"?/);
-				if (bandwidthMatch)
-					currentAdaptationSet.bandwidth = bandwidthMatch[1]
-						? parseInt(bandwidthMatch[1])
-						: null;
-
-				var widthMatch = line.match(/width="?(\d+)?"?/);
-				if (widthMatch)
-					currentAdaptationSet.width = widthMatch[1]
-						? parseInt(widthMatch[1])
-						: null;
-
-				var heightMatch = line.match(/height="?(\d+)?"?/);
-				if (heightMatch)
-					currentAdaptationSet.height = heightMatch[1]
-						? parseInt(heightMatch[1])
-						: null;
-
-				var frameRateMatch = line.match(/frameRate="([^"]*)"/);
-				if (frameRateMatch) currentAdaptationSet.frameRate = frameRateMatch[1];
-			} else if (line.includes("<Representation")) {
-				currentRepresentation = {
-					id: null,
-					bandwidth: null,
-					width: null,
-					height: null,
-					frameRate: null,
-					codecs: null,
-					mimeType: null,
-				};
-
-				var idMatch = line.match(/id="?([^"\s]+)"?/);
-				if (idMatch) currentRepresentation.id = idMatch[1];
-
-				var bandwidthMatch2 = line.match(/bandwidth="?(\d+)?"?/);
-				if (bandwidthMatch2)
-					currentRepresentation.bandwidth = bandwidthMatch2[1]
-						? parseInt(bandwidthMatch2[1])
-						: null;
-
-				var widthMatch2 = line.match(/width="?(\d+)?"?/);
-				if (widthMatch2)
-					currentRepresentation.width = widthMatch2[1]
-						? parseInt(widthMatch2[1])
-						: null;
-
-				var heightMatch2 = line.match(/height="?(\d+)?"?/);
-				if (heightMatch2)
-					currentRepresentation.height = heightMatch2[1]
-						? parseInt(heightMatch2[1])
-						: null;
-
-				var codecsMatch2 = line.match(/codecs="([^"]*)"/);
-				if (codecsMatch2) currentRepresentation.codecs = codecsMatch2[1];
-
-				var mimeTypeMatch2 = line.match(/mimeType="([^"]*)"/);
-				if (mimeTypeMatch2) currentRepresentation.mimeType = mimeTypeMatch2[1];
-
-				if (currentAdaptationSet) {
-					currentAdaptationSet.representations.push(currentRepresentation);
-				}
-			} else if (line.includes("</Representation>")) {
-				currentRepresentation = null;
-			} else if (line.includes("</AdaptationSet>")) {
-				if (
-					currentAdaptationSet &&
-					currentAdaptationSet.representations.length > 0
-				) {
-					currentAdaptationSet.representations.forEach(function (rep) {
-						var quality = parseMpdRepresentationQuality(rep);
-						var mime = clean(
-							rep.mimeType || currentAdaptationSet.mimeType || "",
-						).toLowerCase();
-						var isVideo = mime.indexOf("video") !== -1;
-						var isAudio = mime.indexOf("audio") !== -1;
-
-						// Build source label with quality
-						var srcLabel = isVideo ? "Video" : "Audio";
-						if (quality > 0) {
-							srcLabel += " " + quality + "p";
-						} else if (rep.bandwidth > 0) {
-							srcLabel += " " + Math.round(rep.bandwidth / 1000) + "kbps";
-						}
-						if (isAudio && currentAdaptationSet.lang) {
-							srcLabel += " (" + currentAdaptationSet.lang + ")";
-						}
-
-						info.variants.push({
-							url: manifestUrl,
-							quality: quality,
-							source: srcLabel,
-							isVideo: isVideo,
-							isAudio: isAudio,
-							lang: currentAdaptationSet.lang || "",
-							bandwidth: rep.bandwidth || 0,
-							codecs: rep.codecs || currentAdaptationSet.codecs || "",
-						});
-					});
-				}
-				currentAdaptationSet = null;
-			}
-		});
-
-		// Sort variants: video by quality desc, audio after video
-		info.variants.sort(function (a, b) {
-			if (a.isVideo && !b.isVideo) return -1;
-			if (!a.isVideo && b.isVideo) return 1;
-			return b.quality - a.quality;
-		});
-
-		return info;
-	}
-
-	// ═══════════════════════════════════════════════════════════════════════════
-	// Stream Expansion (HLS + DASH quality extraction)
-	// ═══════════════════════════════════════════════════════════════════════════
-
-	/**
-	 * Fetch and expand an HLS master playlist into multiple quality streams
-	 */
-	async function expandHlsStreams(sourceLabel, url, headers) {
-		if (!url || !shouldExpandHlsVariants(url)) return [];
-
-		try {
-			var response = await fetchText(url, headers || {});
-			if (
-				extractResponseStatus(response) < 200 ||
-				extractResponseStatus(response) >= 300
-			)
-				return [];
-
-			var manifestText = extractResponseBody(response);
-			if (
-				!manifestText.startsWith("#EXTM3U") ||
-				manifestText.indexOf("#EXT-X-STREAM-INF") === -1
-			)
-				return [];
-
-			var manifestInfo = parseHlsMasterPlaylist(manifestText, url);
-			var variants =
-				manifestInfo && Array.isArray(manifestInfo.variants)
-					? manifestInfo.variants
-					: [];
-			var seen = {};
-			var streams = [];
-
-			variants.forEach(function (variant) {
-				if (!variant || !variant.url || seen[variant.url]) return;
-				seen[variant.url] = true;
-
-				var quality = parseVariantQuality(variant.attributes || {});
-				var label = sourceLabel;
-				if (quality > 0) {
-					label = sourceLabel + " " + quality + "p";
-				}
-
-				var stream = new StreamResult({
-					source: label,
-					url: variant.url,
-					headers: headers || {},
-				});
-				if (typeof quality === "number" && quality > 0) {
-					stream.quality = quality;
-				}
-				streams.push(stream);
-			});
-
-			return streams;
-		} catch (error) {
-			console.error("[CloudPlay] Failed to expand HLS streams:", error.message);
-			return [];
-		}
-	}
-
-	/**
-	 * Fetch and expand a DASH MPD manifest into multiple quality streams
-	 */
-	async function expandMpdStreams(sourceLabel, url, headers) {
-		if (!url || !isDashManifest(url)) return [];
-
-		try {
-			var response = await fetchText(url, headers || {});
-			if (
-				extractResponseStatus(response) < 200 ||
-				extractResponseStatus(response) >= 300
-			)
-				return [];
-
-			var manifestText = extractResponseBody(response);
-			if (!manifestText.startsWith("<?xml") && !manifestText.includes("<MPD"))
-				return [];
-
-			var manifestInfo = parseMpdMasterPlaylist(manifestText, url);
-			var variants =
-				manifestInfo && Array.isArray(manifestInfo.variants)
-					? manifestInfo.variants
-					: [];
-			if (variants.length === 0) return [];
-
-			var streams = [];
-
-			variants.forEach(function (variant) {
-				var label = sourceLabel + " - " + (variant.source || "Auto");
-				var stream = new StreamResult({
-					source: label,
-					url: variant.url,
-					headers: headers || {},
-				});
-				if (typeof variant.quality === "number" && variant.quality > 0) {
-					stream.quality = variant.quality;
-				}
-				streams.push(stream);
-			});
-
-			// If no variants had quality set, push at least one auto stream
-			if (streams.length === 0) {
-				var fallback = new StreamResult({
-					source: sourceLabel,
-					url: url,
-					headers: headers || {},
-				});
-				fallback.quality = 0;
-				streams.push(fallback);
-			}
-
-			return streams;
-		} catch (error) {
-			console.error("[CloudPlay] Failed to expand MPD streams:", error.message);
-			return [];
-		}
 	}
 
 	// ═══════════════════════════════════════════════════════════════════════════
@@ -1116,10 +819,12 @@
 				});
 			}
 
-			const ch = payload.channel;
+			const ch = payload.channel || {};
 			const streamUrl = ch.url;
 			const headers = Object.assign({}, ch.headers || {});
-			const sourceLabel = ch.title || "CloudPlay";
+			if (ch.userAgent) headers["User-Agent"] = ch.userAgent;
+			if (ch.cookie) headers["Cookie"] = ch.cookie;
+			const sourceLabel = payload.category || ch.title || "CloudPlay";
 
 			if (!streamUrl) {
 				return cb({
@@ -1129,72 +834,49 @@
 				});
 			}
 
-			let streams = [];
-
-			// Try DASH (MPD) quality expansion first
-			if (isDashManifest(streamUrl)) {
-				const expanded = await expandMpdStreams(
-					sourceLabel,
-					streamUrl,
-					headers,
-				);
-				if (expanded.length > 0) {
-					streams = expanded;
-				} else {
-					const fallback = new StreamResult({
-						url: streamUrl,
-						source: sourceLabel,
-						headers: headers,
-					});
-					fallback.quality = 0;
-					streams.push(fallback);
-				}
-
-				// Apply DRM to all streams
-				streams.forEach(function (s) {
-					if (ch.keyHex && ch.kidHex) {
-						s.drmKey = ch.keyHex;
-						s.drmKid = ch.kidHex;
-					} else if (ch.licenseUrl) {
-						s.licenseUrl = ch.licenseUrl;
-					}
-				});
-
-				return cb({ success: true, data: streams });
-			}
-
-			// Try HLS quality expansion
-			if (shouldExpandHlsVariants(streamUrl)) {
-				const expanded = await expandHlsStreams(
-					sourceLabel,
-					streamUrl,
-					headers,
-				);
-				if (expanded.length > 0) {
-					streams = expanded;
-				} else {
-					const fallback = new StreamResult({
-						url: streamUrl,
-						source: sourceLabel,
-						headers: headers,
-					});
-					fallback.quality = 0;
-					streams.push(fallback);
-				}
-
-				return cb({ success: true, data: streams });
-			}
-
-			// Handle direct video URLs (MP4, etc.)
-			const directStream = new StreamResult({
+			// Create a single StreamResult (the player handles quality selection from the manifest)
+			const r = new StreamResult({
 				url: streamUrl,
 				source: sourceLabel,
 				headers: headers,
 			});
-			directStream.quality = 0;
-			streams.push(directStream);
 
-			cb({ success: true, data: streams });
+			// Handle DRM for DASH streams
+			if (isDashManifest(streamUrl)) {
+				// First try: direct key/kid from channel metadata
+				var keyHex = normalizeDrmHex(ch.keyHex);
+				var kidHex = normalizeDrmHex(ch.kidHex);
+
+				// Second try: parse key/kid from license_url like "?keyid=HEX&key=HEX"
+				if (!keyHex || !kidHex) {
+					var parsedKeys = parseKeyIdFromLicenseUrl(ch.licenseUrl);
+					if (parsedKeys) {
+						keyHex = parsedKeys.keyHex;
+						kidHex = parsedKeys.kidHex;
+					}
+				}
+
+				if (keyHex && kidHex) {
+					r.drmKey = keyHex;
+					r.drmKid = kidHex;
+				} else if (ch.licenseUrl) {
+					// License server URL: fetch MPD to get KID, call license server
+					var resolved = await resolveClearKey(
+						streamUrl,
+						ch.licenseUrl,
+						headers,
+					);
+					if (resolved) {
+						r.drmKey = resolved.drmKey;
+						r.drmKid = resolved.drmKid;
+						r.licenseUrl = resolved.licenseUrl;
+					} else {
+						r.licenseUrl = ch.licenseUrl;
+					}
+				}
+			}
+
+			cb({ success: true, data: [r] });
 		} catch (error) {
 			console.error("[CloudPlay] loadStreams error:", error.message);
 			cb({
