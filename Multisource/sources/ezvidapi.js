@@ -33,7 +33,7 @@ var PROVIDERS = [
 	"popr",
 ];
 
-var PER_PROVIDER_TIMEOUT = 15000;
+var PER_PROVIDER_TIMEOUT = 30000;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
@@ -209,7 +209,7 @@ async function scrapeStreams(params) {
 								"&episode=" +
 								(episode || 1);
 
-						var apiResp = await httpGet(apiUrl, apiHeaders, 12000);
+						var apiResp = await httpGet(apiUrl, apiHeaders, 18000);
 						if (!apiResp || apiResp.length < 10) {
 							if (!done) {
 								done = true;
@@ -272,7 +272,7 @@ async function scrapeStreams(params) {
 								Accept: "*/*",
 								Referer: EMBED_BASE + "/",
 							},
-							10000,
+							15000,
 						);
 
 						if (!m3u8Content || m3u8Content.indexOf("#EXTM3U") === -1) {
@@ -378,8 +378,19 @@ async function scrapeStreams(params) {
 			var r = results[ri];
 			if (r.status !== "fulfilled" || !r.value) continue;
 			var res = r.value;
-			if (!res.streams || res.streams.length === 0) continue;
+			if (!res.streams || res.streams.length === 0) {
+				log("  " + res.provider + ": " + (res.error || "no streams"));
+				continue;
+			}
 			workingCount++;
+			log(
+				"  " +
+					res.provider +
+					": " +
+					res.streams.length +
+					" stream(s)" +
+					(res.error ? " (" + res.error + ")" : ""),
+			);
 
 			for (var si = 0; si < res.streams.length; si++) {
 				var s = res.streams[si];
