@@ -34,7 +34,6 @@ var _sourceEntries = [
 	["vixsrc", require("./vixsrc")],
 	["primesrc", require("./primesrc")],
 	["moflix", require("./moflix")],
-	["peachify", require("./peachify")],
 ];
 
 // ─── Build Module Registry ────────────────────────────────────────────
