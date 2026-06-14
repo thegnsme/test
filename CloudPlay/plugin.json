@@ -6,9 +6,5 @@
 	"description": "Live sports and TV channels from CloudPlay with quality selection",
 	"authors": ["phisher98"],
 	"languages": ["en"],
-	"categories": ["LiveTv"],
-	"domains": [
-		{ "name": "host.cloudplay.me", "url": "https://host.cloudplay.me" },
-		{ "name": "mirror1.cloudplay.me", "url": "https://mirror1.cloudplay.me" }
-	]
+	"categories": ["LiveTv"]
 }

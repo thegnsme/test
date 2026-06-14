@@ -25,12 +25,25 @@
 		"X-Package": CLOUDPLAY_PACKAGE,
 	};
 
-	const HEADERS = {
-		accept: "*/*",
-		"Cache-Control": "no-cache, no-store",
-		"User-Agent":
-			"Mozilla/5.0 (Windows NT 10.0; rv:78.0) Gecko/20100101 Firefox/78.0",
-	};
+	// ═══════════════════════════════════════════════════════════════════════════
+	// Channel Cache — shared between getHome, search, and load
+	// ═══════════════════════════════════════════════════════════════════════════
+
+	var CHANNEL_CACHE = null;
+	var CACHE_EXPIRY = 0;
+	var CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+	function getCachedChannels() {
+		if (CHANNEL_CACHE && Date.now() < CACHE_EXPIRY) {
+			return CHANNEL_CACHE;
+		}
+		return null;
+	}
+
+	function setCachedChannels(channels) {
+		CHANNEL_CACHE = channels;
+		CACHE_EXPIRY = Date.now() + CACHE_TTL_MS;
+	}
 
 	// ═══════════════════════════════════════════════════════════════════════════
 	// Utility Helpers
@@ -178,24 +191,39 @@
 	// HTTP Helpers
 	// ═══════════════════════════════════════════════════════════════════════════
 
-	async function fetchText(url, headers) {
+	const FETCH_TIMEOUT_MS = 8000;
+	const FETCH_TIMEOUT_MS_STREAM = 15000;
+
+	async function fetchText(url, headers, timeoutMs) {
 		if (!url || typeof url !== "string") {
 			throw new Error("Invalid URL for fetchText");
 		}
+		timeoutMs = typeof timeoutMs === "number" ? timeoutMs : FETCH_TIMEOUT_MS;
 		try {
 			if (typeof http_get === "function") {
 				return http_get(url, headers || {});
 			}
 			if (typeof fetch === "function") {
-				const response = await fetch(url, { headers: headers || {} });
-				return {
-					status: response.status,
-					body: await response.text(),
-				};
+				var controller = new AbortController();
+				var timer = setTimeout(function () {
+					controller.abort();
+				}, timeoutMs);
+				try {
+					var response = await fetch(url, {
+						headers: headers || {},
+						signal: controller.signal,
+					});
+					return {
+						status: response.status,
+						body: await response.text(),
+					};
+				} finally {
+					clearTimeout(timer);
+				}
 			}
 			throw new Error("GET requests are not supported in this runtime");
 		} catch (error) {
-			console.error(`Failed to fetch text from ${url}: ${error.message}`);
+			console.error("Failed to fetch text from " + url + ": " + error.message);
 			throw error;
 		}
 	}
@@ -396,13 +424,286 @@
 	}
 
 	// ═══════════════════════════════════════════════════════════════════════════
+	// HLS Master Playlist Parser (Quality Selection)
+	// ═══════════════════════════════════════════════════════════════════════════
+
+	function parseHlsAttributes(line) {
+		const attributes = {};
+		const regex = /([A-Z0-9-]+)=("[^"]*"|[^,]*)/g;
+		let match;
+		while ((match = regex.exec(String(line || ""))) !== null) {
+			const key = clean(match[1]).toUpperCase();
+			const value = clean(match[2]).replace(/^"|"$/g, "");
+			if (key) attributes[key] = value;
+		}
+		return attributes;
+	}
+
+	function resolveVariantUrl(baseUrl, variantPath) {
+		const target = clean(variantPath);
+		if (!target) return "";
+		try {
+			const resolved = new URL(target, baseUrl);
+			const base = new URL(baseUrl);
+			if (!resolved.search && !target.includes("?") && base.search) {
+				resolved.search = base.search;
+			}
+			return resolved.toString();
+		} catch (_) {
+			return target;
+		}
+	}
+
+	function parseVariantQuality(attributes) {
+		if (!attributes || typeof attributes !== "object") return 0;
+		const resolution = clean(attributes.RESOLUTION);
+		const resolutionMatch = /(\d+)\s*x\s*(\d+)/i.exec(resolution);
+		if (resolutionMatch) return parseInt(resolutionMatch[2], 10) || 0;
+
+		const bandwidth = parseInt(
+			attributes["AVERAGE-BANDWIDTH"] || attributes.BANDWIDTH || "0",
+			10,
+		);
+		if (!bandwidth || bandwidth < 1) return 0;
+		if (bandwidth >= 20000000) return 2160;
+		if (bandwidth >= 10000000) return 1080;
+		if (bandwidth >= 6000000) return 720;
+		if (bandwidth >= 3000000) return 480;
+		if (bandwidth >= 1500000) return 360;
+		if (bandwidth >= 800000) return 240;
+		if (bandwidth >= 400000) return 144;
+		return 0;
+	}
+
+	function parseHlsMasterPlaylist(manifestText, manifestUrl) {
+		const variants = [];
+		const lines = String(manifestText || "").split(/\r?\n/);
+		let pendingAttributes = null;
+
+		lines.forEach(function (rawLine) {
+			const line = rawLine.trim();
+			if (!line) return;
+			if (line.startsWith("#EXT-X-STREAM-INF:")) {
+				pendingAttributes = parseHlsAttributes(
+					line.slice("#EXT-X-STREAM-INF:".length),
+				);
+				return;
+			}
+			if (line.startsWith("#")) return;
+			if (pendingAttributes) {
+				const resolved = resolveVariantUrl(manifestUrl, line);
+				if (resolved) {
+					variants.push({
+						url: resolved,
+						attributes: pendingAttributes,
+					});
+				}
+				pendingAttributes = null;
+			}
+		});
+
+		return variants;
+	}
+
+	function shouldExpandHlsVariants(url) {
+		const value = clean(url).toLowerCase();
+		if (!value || /\.mpd(?:$|[?#])/i.test(value)) return false;
+		return (
+			/\.m3u8(?:$|[?#])/i.test(value) ||
+			value.includes("/hls/") ||
+			value.includes("m3u8")
+		);
+	}
+
+	function isDashManifest(url) {
+		return clean(url).toLowerCase().includes(".mpd");
+	}
+
+	// ═══════════════════════════════════════════════════════════════════════════
+	// DASH MPD Manifest Parser (Quality Selection)
+	// ═══════════════════════════════════════════════════════════════════════════
+
+	function parseMpdRepresentationQuality(representation) {
+		if (!representation || typeof representation !== "object") return 0;
+		const resolution = representation.height;
+		if (resolution && resolution > 0) {
+			if (resolution >= 4320) return 4320;
+			if (resolution >= 2160) return 2160;
+			if (resolution >= 1080) return 1080;
+			if (resolution >= 720) return 720;
+			if (resolution >= 480) return 480;
+			if (resolution >= 360) return 360;
+			if (resolution >= 240) return 240;
+			if (resolution >= 144) return 144;
+		}
+		const bandwidth = representation.bandwidth;
+		if (bandwidth && bandwidth > 0) {
+			if (bandwidth >= 20000000) return 2160;
+			if (bandwidth >= 10000000) return 1080;
+			if (bandwidth >= 6000000) return 720;
+			if (bandwidth >= 3000000) return 480;
+			if (bandwidth >= 1500000) return 360;
+			if (bandwidth >= 800000) return 240;
+			if (bandwidth >= 400000) return 144;
+		}
+		return 0;
+	}
+
+	function buildMpdVariantPlaybackUrl(representation, baseUrl) {
+		if (!representation || typeof representation !== "object") return "";
+		const segBase = representation.id
+			? "RepresentationID=" + representation.id
+			: "";
+		const quality = representation.bandwidth
+			? "quality=" + representation.bandwidth
+			: "";
+		let playbackUrl = baseUrl;
+		if (segBase)
+			playbackUrl += (playbackUrl.indexOf("?") >= 0 ? "&" : "?") + segBase;
+		if (quality)
+			playbackUrl += (playbackUrl.indexOf("?") >= 0 ? "&" : "?") + quality;
+		return playbackUrl;
+	}
+
+	function parseMpdMasterPlaylist(manifestText, manifestUrl) {
+		const variants = [];
+		const lines = String(manifestText || "").split(/\r?\n/);
+		let currentAdaptationSet = null;
+		let currentRepresentation = null;
+
+		lines.forEach(function (rawLine) {
+			const line = rawLine.trim();
+			if (!line) return;
+
+			if (line.indexOf("<AdaptationSet") >= 0) {
+				currentAdaptationSet = {
+					mimeType: null,
+					codecs: null,
+					contentType: null,
+					representations: [],
+				};
+				const mimeTypeMatch = line.match(/mimeType="([^"]*)"/);
+				if (mimeTypeMatch) currentAdaptationSet.mimeType = mimeTypeMatch[1];
+				const codecsMatch = line.match(/codecs="([^"]*)"/);
+				if (codecsMatch) currentAdaptationSet.codecs = codecsMatch[1];
+				const contentTypeMatch = line.match(/contentType="([^"]*)"/i);
+				if (contentTypeMatch)
+					currentAdaptationSet.contentType = contentTypeMatch[1].toLowerCase();
+			} else if (line.indexOf("<Representation") >= 0) {
+				currentRepresentation = {
+					id: null,
+					bandwidth: null,
+					width: null,
+					height: null,
+					codecs: null,
+					mimeType: null,
+				};
+				const idMatch = line.match(/id="?([^"\s]+)"?/);
+				if (idMatch) currentRepresentation.id = idMatch[1];
+				const bwMatch = line.match(/bandwidth="?(\d+)?"?/);
+				if (bwMatch)
+					currentRepresentation.bandwidth = bwMatch[1]
+						? parseInt(bwMatch[1])
+						: null;
+				const wMatch = line.match(/width="?(\d+)?"?/);
+				if (wMatch)
+					currentRepresentation.width = wMatch[1] ? parseInt(wMatch[1]) : null;
+				const hMatch = line.match(/height="?(\d+)?"?/);
+				if (hMatch)
+					currentRepresentation.height = hMatch[1] ? parseInt(hMatch[1]) : null;
+				const codecsMatch2 = line.match(/codecs="([^"]*)"/);
+				if (codecsMatch2) currentRepresentation.codecs = codecsMatch2[1];
+				const mimeTypeMatch2 = line.match(/mimeType="([^"]*)"/);
+				if (mimeTypeMatch2) currentRepresentation.mimeType = mimeTypeMatch2[1];
+				if (currentAdaptationSet) {
+					currentAdaptationSet.representations.push(currentRepresentation);
+				}
+			} else if (line.indexOf("</Representation>") >= 0) {
+				currentRepresentation = null;
+			} else if (line.indexOf("</AdaptationSet>") >= 0) {
+				if (
+					currentAdaptationSet &&
+					currentAdaptationSet.representations.length > 0
+				) {
+					variants.push(currentAdaptationSet);
+				}
+				currentAdaptationSet = null;
+			}
+		});
+
+		// Separate video and audio AdaptationSets
+		var adaptationSets = variants;
+		var videoReps = [];
+		var audioReps = [];
+		for (var asi = 0; asi < adaptationSets.length; asi++) {
+			var as = adaptationSets[asi];
+			var isAudio =
+				as.contentType === "audio" ||
+				(as.mimeType && as.mimeType.indexOf("audio") >= 0);
+			var isVideo =
+				!isAudio &&
+				(as.contentType === "video" ||
+					(as.mimeType && as.mimeType.indexOf("video") >= 0) ||
+					(!as.mimeType &&
+						as.representations.some(function (r) {
+							return r.height;
+						})));
+			if (isAudio) {
+				for (var ai = 0; ai < as.representations.length; ai++)
+					audioReps.push(as.representations[ai]);
+			} else if (isVideo) {
+				for (var vi = 0; vi < as.representations.length; vi++)
+					videoReps.push(as.representations[vi]);
+			} else {
+				// Unknown type — treat as video
+				for (var xi = 0; xi < as.representations.length; xi++)
+					videoReps.push(as.representations[xi]);
+			}
+		}
+
+		// Build combined video+audio URLs
+		var result = [];
+		for (var vi = 0; vi < videoReps.length; vi++) {
+			var rep = videoReps[vi];
+			var quality = parseMpdRepresentationQuality(rep);
+			var url = buildMpdVariantPlaybackUrl(rep, manifestUrl);
+			if (url) {
+				// Append audio RepresentationIDs so audio tracks are preserved
+				for (var ai = 0; ai < audioReps.length; ai++) {
+					var audioId = audioReps[ai].id;
+					if (audioId) {
+						url += "&RepresentationID=" + audioId;
+					}
+				}
+				result.push({ url: url, quality: quality });
+			}
+		}
+
+		// Also include standalone audio-only streams for language selection
+		for (var ai = 0; ai < audioReps.length; ai++) {
+			var audioRep = audioReps[ai];
+			var audioUrl = buildMpdVariantPlaybackUrl(audioRep, manifestUrl);
+			if (audioUrl) {
+				var dup = false;
+				for (var ri = 0; ri < result.length; ri++) {
+					if (result[ri].url === audioUrl) dup = true;
+				}
+				if (!dup) {
+					result.push({ url: audioUrl, quality: 0, isAudio: true });
+				}
+			}
+		}
+
+		result.sort(function (a, b) {
+			return b.quality - a.quality;
+		});
+		return result;
+	}
+
+	// ═══════════════════════════════════════════════════════════════════════════
 	// DRM Helpers
 	// ═══════════════════════════════════════════════════════════════════════════
 
-	/**
-	 * Normalize any DRM identifier to lowercase hex
-	 * Accepts: hex with dashes, pure hex, or base64url
-	 */
 	function normalizeDrmHex(v) {
 		const s = clean(v);
 		if (!s || s.toLowerCase() === "null") return null;
@@ -445,11 +746,6 @@
 		}
 	}
 
-	/**
-	 * Parse key/kid from a license URL like:
-	 *   https://dummy.com/?keyid=KID_HEX&key=KEY_HEX
-	 * Returns { keyHex, kidHex } or null
-	 */
 	function parseKeyIdFromLicenseUrl(licenseUrl) {
 		const url = clean(licenseUrl);
 		if (!url) return null;
@@ -463,12 +759,6 @@
 		return null;
 	}
 
-	/**
-	 * Resolve ClearKey from a license server URL
-	 * 1. Fetch MPD manifest to extract cenc:default_KID
-	 * 2. Call license server with the KID (base64url)
-	 * 3. Return key in hex
-	 */
 	async function resolveClearKey(mpdUrl, licenseUrl, mpdHeaders) {
 		try {
 			const response = await fetchText(mpdUrl, mpdHeaders || {});
@@ -477,15 +767,12 @@
 				extractResponseStatus(response) >= 300
 			)
 				return null;
-
 			const body = extractResponseBody(response);
 			const kidMatch = body.match(/cenc:default_KID=["']([^"']+)["']/i);
 			if (!kidMatch) return null;
-
 			const kidHex = kidMatch[1].replace(/-/g, "").toLowerCase();
 			const kidB64 = hexToBase64Url(kidHex);
 			if (!kidB64) return null;
-
 			const lRes = await postJson(
 				licenseUrl,
 				{ kids: [kidB64], type: "temporary" },
@@ -494,7 +781,6 @@
 					"Content-Type": "application/json;charset=UTF-8",
 				},
 			);
-
 			const lData = parseJsonSafe(extractResponseBody(lRes), {});
 			const keys = Array.isArray(lData.keys) ? lData.keys : [];
 			if (keys.length > 0 && keys[0].k) {
@@ -511,9 +797,6 @@
 		return null;
 	}
 
-	/**
-	 * POST JSON helper (for license server calls)
-	 */
 	async function postJson(url, payload, headers) {
 		if (!url || typeof url !== "string") {
 			throw new Error("Invalid URL for postJson");
@@ -542,10 +825,6 @@
 			console.error("Failed to POST to " + url + ": " + error.message);
 			throw error;
 		}
-	}
-
-	function isDashManifest(url) {
-		return clean(url).toLowerCase().includes(".mpd");
 	}
 
 	// ═══════════════════════════════════════════════════════════════════════════
@@ -583,16 +862,24 @@
 	}
 
 	/**
-	 * Fetch channels from a stream URL
-	 * Handles: M3U, CloudPlayChannel JSON (m3u8_url/mpd_url), CloudPlayStream JSON (recursive)
+	 * Fetch channels from a stream URL.
+	 * Handles: M3U, CloudPlayChannel JSON (m3u8_url/mpd_url), CloudPlayStream JSON (recursive).
+	 * Uses okhttp headers for all CloudPlay API calls — same as Kotlin does.
 	 */
-	async function fetchChannels(url, fallbackLogo) {
+	async function fetchChannels(url, fallbackLogo, depth) {
+		depth = typeof depth === "number" ? depth : 0;
+		if (depth > 3) return []; // prevent infinite recursion
+
 		const channels = [];
 		const request = splitUrlAndHeaders(url);
-		const isHost = url.includes("host.cloudplay.me");
-		const headers = isHost ? API_HEADERS : HEADERS;
 
-		const response = await fetchText(request.url, headers);
+		var response;
+		try {
+			response = await fetchText(request.url, API_HEADERS, FETCH_TIMEOUT_MS);
+		} catch (_) {
+			return channels;
+		}
+
 		if (
 			extractResponseStatus(response) < 200 ||
 			extractResponseStatus(response) >= 300
@@ -645,20 +932,23 @@
 				}
 
 				// CloudPlayStream objects (has url, needs recursive fetch)
-				if (
-					jsonChannels[0].url &&
-					!jsonChannels[0].m3u8_url &&
-					!jsonChannels[0].mpd_url
-				) {
-					const nestedChannels = [];
-					for (const stream of jsonChannels) {
-						const subChannels = await fetchChannels(
-							stream.url,
-							stream.logo || fallbackLogo,
-						);
-						nestedChannels.push(...subChannels);
-					}
-					return nestedChannels;
+				if (jsonChannels[0].url) {
+					// Fetch all sub-channels concurrently
+					var results = await Promise.allSettled(
+						jsonChannels.map(function (stream) {
+							return fetchChannels(
+								stream.url,
+								stream.logo || fallbackLogo,
+								depth + 1,
+							);
+						}),
+					);
+					results.forEach(function (r) {
+						if (r.status === "fulfilled" && Array.isArray(r.value)) {
+							channels.push.apply(channels, r.value);
+						}
+					});
+					return channels;
 				}
 			}
 		} catch (_) {}
@@ -670,31 +960,77 @@
 	// Core SkyStream API Functions
 	// ═══════════════════════════════════════════════════════════════════════════
 
-	async function getHome(cb) {
+	/**
+	 * Internal: fetch all channels from all categories with concurrency and caching
+	 * Returns { categories: { "Category": [channels...] }, allChannels: [flat...] }
+	 */
+	async function fetchAllChannels() {
+		var cached = getCachedChannels();
+		if (cached) return cached;
+
+		var streams;
 		try {
-			const streams = await fetchCloudPlayStreams();
-			const data = {};
+			streams = await fetchCloudPlayStreams();
+		} catch (_) {
+			return { categories: {}, allChannels: [] };
+		}
 
-			for (const stream of streams) {
-				const categoryName = stream.name || "Unknown";
-				const channels = await fetchChannels(stream.url, stream.logo);
+		var results = await Promise.allSettled(
+			streams.map(function (stream) {
+				return fetchChannels(stream.url, stream.logo).then(function (channels) {
+					return {
+						name: stream.name || "Unknown",
+						channels: channels,
+					};
+				});
+			}),
+		);
 
-				if (channels.length > 0) {
-					data[categoryName] = channels.map(function (ch) {
-						return new MultimediaItem({
-							title: ch.title,
-							posterUrl: ch.poster,
-							type: "livestream",
-							description: ch.group || categoryName,
-							url: JSON.stringify({
-								kind: "channel",
-								channel: ch,
-								category: categoryName,
-							}),
-						});
-					});
+		var categories = {};
+		var allChannels = [];
+		var categoryOrder = [];
+
+		results.forEach(function (r) {
+			if (r.status === "fulfilled") {
+				var entry = r.value;
+				if (entry.channels && entry.channels.length > 0) {
+					categories[entry.name] = entry.channels;
+					categoryOrder.push(entry.name);
+					allChannels.push.apply(allChannels, entry.channels);
 				}
 			}
+		});
+
+		var result = {
+			categories: categories,
+			allChannels: allChannels,
+			categoryOrder: categoryOrder,
+		};
+
+		setCachedChannels(result);
+		return result;
+	}
+
+	async function getHome(cb) {
+		try {
+			var full = await fetchAllChannels();
+			var data = {};
+
+			full.categoryOrder.forEach(function (name) {
+				data[name] = full.categories[name].map(function (ch) {
+					return new MultimediaItem({
+						title: ch.title,
+						posterUrl: ch.poster,
+						type: "livestream",
+						description: ch.group || name,
+						url: JSON.stringify({
+							kind: "channel",
+							channel: ch,
+							category: name,
+						}),
+					});
+				});
+			});
 
 			cb({ success: true, data: data });
 		} catch (error) {
@@ -765,21 +1101,14 @@
 				return cb({ success: true, data: [] });
 			}
 
-			const streams = await fetchCloudPlayStreams();
-			const allChannels = [];
-
-			for (const stream of streams) {
-				const channels = await fetchChannels(stream.url, stream.logo);
-				allChannels.push(...channels);
-			}
-
-			const results = allChannels.filter(function (ch) {
-				const title = clean(ch.title).toLowerCase();
-				const group = clean(ch.group).toLowerCase();
-				return title.includes(q) || group.includes(q);
+			var full = await fetchAllChannels();
+			var results = full.allChannels.filter(function (ch) {
+				var title = clean(ch.title).toLowerCase();
+				var group = clean(ch.group).toLowerCase();
+				return title.indexOf(q) >= 0 || group.indexOf(q) >= 0;
 			});
 
-			const items = results.map(function (ch) {
+			var items = results.map(function (ch) {
 				return new MultimediaItem({
 					title: ch.title,
 					posterUrl: ch.poster,
@@ -799,6 +1128,45 @@
 			cb({ success: true, data: [] });
 		}
 	}
+
+	// ═══════════════════════════════════════════════════════════════════════════
+	// DRM Resolution for DASH
+	// ═══════════════════════════════════════════════════════════════════════════
+
+	async function resolveDrmInfo(ch, streamUrl, headers) {
+		var keyHex = normalizeDrmHex(ch.keyHex);
+		var kidHex = normalizeDrmHex(ch.kidHex);
+
+		if (!keyHex || !kidHex) {
+			var parsedKeys = parseKeyIdFromLicenseUrl(ch.licenseUrl);
+			if (parsedKeys) {
+				keyHex = parsedKeys.keyHex;
+				kidHex = parsedKeys.kidHex;
+			}
+		}
+
+		if (keyHex && kidHex) {
+			return { drmKey: keyHex, drmKid: kidHex };
+		}
+
+		if (ch.licenseUrl) {
+			var resolved = await resolveClearKey(streamUrl, ch.licenseUrl, headers);
+			if (resolved) {
+				return {
+					drmKey: resolved.drmKey,
+					drmKid: resolved.drmKid,
+					licenseUrl: resolved.licenseUrl,
+				};
+			}
+			return { licenseUrl: ch.licenseUrl };
+		}
+
+		return null;
+	}
+
+	// ═══════════════════════════════════════════════════════════════════════════
+	// loadStreams — Quality Selection for HLS & DASH
+	// ═══════════════════════════════════════════════════════════════════════════
 
 	async function loadStreams(url, cb) {
 		try {
@@ -834,47 +1202,34 @@
 				});
 			}
 
-			// Create a single StreamResult (the player handles quality selection from the manifest)
+			// ── DASH: fetch MPD, expand variants, inject DRM ──
+			if (isDashManifest(streamUrl)) {
+				const drmInfo = await resolveDrmInfo(ch, streamUrl, headers);
+				const streams = await expandDashVariants(
+					sourceLabel,
+					streamUrl,
+					headers,
+					drmInfo,
+				);
+				return cb({ success: true, data: streams });
+			}
+
+			// ── HLS: fetch master, expand variants ──
+			if (shouldExpandHlsVariants(streamUrl)) {
+				const streams = await expandHlsVariants(
+					sourceLabel,
+					streamUrl,
+					headers,
+				);
+				return cb({ success: true, data: streams });
+			}
+
+			// ── Direct URL: single stream ──
 			const r = new StreamResult({
 				url: streamUrl,
 				source: sourceLabel,
 				headers: headers,
 			});
-
-			// Handle DRM for DASH streams
-			if (isDashManifest(streamUrl)) {
-				// First try: direct key/kid from channel metadata
-				var keyHex = normalizeDrmHex(ch.keyHex);
-				var kidHex = normalizeDrmHex(ch.kidHex);
-
-				// Second try: parse key/kid from license_url like "?keyid=HEX&key=HEX"
-				if (!keyHex || !kidHex) {
-					var parsedKeys = parseKeyIdFromLicenseUrl(ch.licenseUrl);
-					if (parsedKeys) {
-						keyHex = parsedKeys.keyHex;
-						kidHex = parsedKeys.kidHex;
-					}
-				}
-
-				if (keyHex && kidHex) {
-					r.drmKey = keyHex;
-					r.drmKid = kidHex;
-				} else if (ch.licenseUrl) {
-					// License server URL: fetch MPD to get KID, call license server
-					var resolved = await resolveClearKey(
-						streamUrl,
-						ch.licenseUrl,
-						headers,
-					);
-					if (resolved) {
-						r.drmKey = resolved.drmKey;
-						r.drmKid = resolved.drmKid;
-						r.licenseUrl = resolved.licenseUrl;
-					} else {
-						r.licenseUrl = ch.licenseUrl;
-					}
-				}
-			}
 
 			cb({ success: true, data: [r] });
 		} catch (error) {
@@ -884,6 +1239,229 @@
 				errorCode: "STREAM_ERROR",
 				message: error.message,
 			});
+		}
+	}
+
+	// ═══════════════════════════════════════════════════════════════════════════
+	// HLS Variant Expansion
+	// ═══════════════════════════════════════════════════════════════════════════
+
+	function buildHlsVariantSource(baseSource, attributes, fallbackIndex) {
+		const quality = parseVariantQuality(attributes);
+		if (quality > 0) {
+			return { quality: quality, source: baseSource + " " + quality + "p" };
+		}
+
+		const bandwidth = parseInt(
+			attributes["AVERAGE-BANDWIDTH"] || attributes.BANDWIDTH || "0",
+			10,
+		);
+		if (bandwidth > 0) {
+			return {
+				quality: 0,
+				source:
+					baseSource + " " + Math.max(1, Math.round(bandwidth / 1000)) + "kbps",
+			};
+		}
+
+		return {
+			quality: 0,
+			source: baseSource + " Variant " + (fallbackIndex + 1),
+		};
+	}
+
+	async function expandHlsVariants(sourceLabel, masterUrl, headers) {
+		try {
+			var response = await fetchText(masterUrl, headers);
+			if (
+				extractResponseStatus(response) < 200 ||
+				extractResponseStatus(response) >= 300
+			) {
+				return [
+					new StreamResult({
+						url: masterUrl,
+						source: sourceLabel,
+						headers: headers,
+					}),
+				];
+			}
+
+			var manifestText = clean(extractResponseBody(response));
+			if (
+				!manifestText.startsWith("#EXTM3U") ||
+				manifestText.indexOf("#EXT-X-STREAM-INF") === -1
+			) {
+				return [
+					new StreamResult({
+						url: masterUrl,
+						source: sourceLabel,
+						headers: headers,
+					}),
+				];
+			}
+
+			var variants = parseHlsMasterPlaylist(manifestText, masterUrl);
+			if (!Array.isArray(variants) || variants.length === 0) {
+				return [
+					new StreamResult({
+						url: masterUrl,
+						source: sourceLabel,
+						headers: headers,
+					}),
+				];
+			}
+
+			var seen = {};
+			var streams = [];
+
+			variants.forEach(function (variant, index) {
+				if (!variant || !variant.url || seen[variant.url]) return;
+				seen[variant.url] = true;
+
+				var variantInfo = buildHlsVariantSource(
+					sourceLabel,
+					variant.attributes || {},
+					index,
+				);
+
+				var r = new StreamResult({
+					url: variant.url,
+					source: variantInfo.source,
+					headers: headers,
+				});
+
+				if (variantInfo.quality > 0) {
+					r.quality = variantInfo.quality;
+				}
+
+				streams.push(r);
+			});
+
+			if (streams.length === 0) {
+				return [
+					new StreamResult({
+						url: masterUrl,
+						source: sourceLabel,
+						headers: headers,
+					}),
+				];
+			}
+
+			return streams;
+		} catch (error) {
+			console.error("[CloudPlay] HLS expand error:", error.message);
+			return [
+				new StreamResult({
+					url: masterUrl,
+					source: sourceLabel,
+					headers: headers,
+				}),
+			];
+		}
+	}
+
+	// ═══════════════════════════════════════════════════════════════════════════
+	// DASH Variant Expansion
+	// ═══════════════════════════════════════════════════════════════════════════
+
+	async function expandDashVariants(sourceLabel, mpdUrl, headers, drmInfo) {
+		try {
+			var response = await fetchText(mpdUrl, headers);
+			if (
+				extractResponseStatus(response) < 200 ||
+				extractResponseStatus(response) >= 300
+			) {
+				var r = new StreamResult({
+					url: mpdUrl,
+					source: sourceLabel,
+					headers: headers,
+				});
+				if (drmInfo) applyDrmToStream(r, drmInfo);
+				return [r];
+			}
+
+			var manifestText = extractResponseBody(response);
+			var variants = parseMpdMasterPlaylist(manifestText, mpdUrl);
+			if (!Array.isArray(variants) || variants.length === 0) {
+				var r = new StreamResult({
+					url: mpdUrl,
+					source: sourceLabel,
+					headers: headers,
+				});
+				if (drmInfo) applyDrmToStream(r, drmInfo);
+				return [r];
+			}
+
+			var seen = {};
+			var streams = [];
+
+			variants.forEach(function (variant) {
+				if (!variant.url || seen[variant.url]) return;
+				seen[variant.url] = true;
+
+				var r;
+				if (variant.isAudio) {
+					// Audio-only stream — label with language/bandwidth hint
+					var audioLabel = " Audio";
+					if (variant.quality > 0) {
+						audioLabel += " " + variant.quality + "p";
+					}
+					r = new StreamResult({
+						url: variant.url,
+						source: sourceLabel + audioLabel,
+						headers: headers,
+					});
+				} else {
+					var qualityLabel =
+						variant.quality > 0 ? " " + variant.quality + "p" : "";
+					r = new StreamResult({
+						url: variant.url,
+						source: sourceLabel + qualityLabel,
+						headers: headers,
+					});
+					if (variant.quality > 0) {
+						r.quality = variant.quality;
+					}
+				}
+
+				if (drmInfo) applyDrmToStream(r, drmInfo);
+				streams.push(r);
+			});
+
+			if (streams.length === 0) {
+				var r = new StreamResult({
+					url: mpdUrl,
+					source: sourceLabel,
+					headers: headers,
+				});
+				if (drmInfo) applyDrmToStream(r, drmInfo);
+				return [r];
+			}
+
+			return streams;
+		} catch (error) {
+			console.error("[CloudPlay] DASH expand error:", error.message);
+			var r = new StreamResult({
+				url: mpdUrl,
+				source: sourceLabel,
+				headers: headers,
+			});
+			if (drmInfo) applyDrmToStream(r, drmInfo);
+			return [r];
+		}
+	}
+
+	function applyDrmToStream(r, drmInfo) {
+		if (!drmInfo) return;
+		if (drmInfo.drmKey && drmInfo.drmKid) {
+			r.drmKey = drmInfo.drmKey;
+			r.drmKid = drmInfo.drmKid;
+			r.drmType = "clearkey";
+		}
+		if (drmInfo.licenseUrl) {
+			r.licenseUrl = drmInfo.licenseUrl;
+			r.drmLicenseUrl = drmInfo.licenseUrl;
+			if (!r.drmType) r.drmType = "widevine";
 		}
 	}
 
