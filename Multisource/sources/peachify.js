@@ -103,10 +103,128 @@ async function httpGet(url, headers) {
 		if (typeof raw === "string") return raw;
 		if (raw && raw.body) {
 			if (typeof raw.body === "string") return raw.body;
-			if (typeof raw.body === "object") return JSON.stringify(raw.body);
 		}
 	} catch (e) {}
 	return "";
+}
+
+// httpGetRaw returns { status, body, error } with a configurable timeout.
+// Uses the same await pattern as httpGet (which is reliable) but with
+// an external timeout wrapper to avoid race-condition issues.
+function httpGetRaw(url, headers, ms) {
+	ms = ms || 10000;
+	return new Promise(function (resolve) {
+		var done = false;
+		var t = setTimeout(function () {
+			if (!done) {
+				done = true;
+				resolve({ status: 0, body: "", error: "timeout" });
+			}
+		}, ms);
+		(async function () {
+			try {
+				var raw = await globalThis.http_get(url, headers || {});
+				if (done) return;
+				done = true;
+				clearTimeout(t);
+				var status =
+					raw && (raw.status || raw.statusCode)
+						? raw.status || raw.statusCode
+						: 200;
+				var body = "";
+				if (typeof raw === "string") body = raw;
+				else if (raw && raw.body)
+					body =
+						typeof raw.body === "string" ? raw.body : JSON.stringify(raw.body);
+				resolve({ status: status, body: body });
+			} catch (e) {
+				if (done) return;
+				done = true;
+				clearTimeout(t);
+				resolve({ status: 0, body: "" });
+			}
+		})();
+	});
+}
+
+// ─── Stream Validation ────────────────────────────────────────────────────
+
+// In-query cache to avoid re-validating the same URL multiple times.
+var _validationCache = {};
+var _validationCacheKeys = [];
+var VALIDATION_CACHE_MAX = 100;
+
+function validationCacheGet(url) {
+	return _validationCache[url];
+}
+function validationCacheSet(url, result) {
+	if (_validationCacheKeys.length >= VALIDATION_CACHE_MAX) {
+		var oldKey = _validationCacheKeys.shift();
+		delete _validationCache[oldKey];
+	}
+	if (_validationCache[url] === undefined) {
+		_validationCacheKeys.push(url);
+	}
+	_validationCache[url] = result;
+}
+function validationCacheClear() {
+	_validationCache = {};
+	_validationCacheKeys = [];
+}
+
+// checkStreamAlive verifies a stream URL actually returns playable content.
+//   - M3U8/HLS: downloads the small playlist and verifies #EXTM3U header
+//   - MP4: CAN'T validate without downloading full file, so trust the API.
+//          The MP4 proxy URLs are ephemeral (signed URLs) and change per-query,
+//          so returning them is the best we can do — the player handles errors.
+//   - Unknown type: try M3U8 first (most are HLS), then trust API.
+// Returns true if the stream is likely playable, false if confirmed dead.
+// Results are cached per URL within a single scrapeStreams call.
+async function checkStreamAlive(url, type, timeoutMs) {
+	timeoutMs = timeoutMs || 10000;
+
+	// Check cache first
+	var cached = validationCacheGet(url);
+	if (cached !== undefined) return cached;
+
+	// M3U8/HLS: small files, download and verify
+	if (type === "hls" || type === "m3u8" || type === "m3u") {
+		var resp = await httpGetRaw(url, HEADERS, timeoutMs);
+		if (resp.status !== 200) {
+			log("  ⛔ M3U8: HTTP " + resp.status + " — filtered");
+			validationCacheSet(url, false);
+			return false;
+		}
+		var body = resp.body || "";
+		if (body.indexOf("#EXTM3U") === -1) {
+			log("  ⛔ M3U8: no #EXTM3U in body — filtered");
+			validationCacheSet(url, false);
+			return false;
+		}
+		validationCacheSet(url, true);
+		return true;
+	}
+
+	// MP4: trust the API — can't validate without full download
+	// (Range requests aren't supported by the MP4 proxies, and a full
+	//  download would be too slow for multi-GB files)
+	if (type === "mp4") {
+		validationCacheSet(url, true);
+		return true;
+	}
+
+	// Unknown type: try M3U8 check first
+	var resp2 = await httpGetRaw(url, HEADERS, timeoutMs);
+	if (resp2.status === 200) {
+		var body2 = resp2.body || "";
+		if (body2.indexOf("#EXTM3U") !== -1) {
+			validationCacheSet(url, true);
+			return true;
+		}
+	}
+	// Not HLS — trust the API (probably an MP4 with no type field)
+	validationCacheSet(url, true);
+	return true;
 }
 
 // ─── Base64 ──────────────────────────────────────────────────────────────
@@ -512,6 +630,9 @@ async function scrapeStreams(params) {
 
 	if (!tmdbId) return makeFail("no tmdbId provided", start);
 
+	// Clear per-query validation cache
+	validationCacheClear();
+
 	var isMovie = type !== "tv" && type !== "series";
 	var keyBytes = getKey();
 	if (!keyBytes) return makeFail("failed to derive AES key", start);
@@ -604,21 +725,74 @@ async function scrapeStreams(params) {
 									}
 								}
 
-								var streams = [];
+								// Phase 1: Parse all sources (fast, no I/O)
+								var parsedSources = [];
 								for (var srcIdx = 0; srcIdx < sources.length; srcIdx++) {
 									var rawSrc = sources[srcIdx];
+									// Spider HLS proxies return 403 Forbidden (consistent failure)
+									if (srv.label === "Spider" && rawSrc.type === "hls") continue;
 									var parsed = parsePeachifySource(rawSrc, srv.label);
 									if (!parsed) continue;
+									parsedSources.push({
+										parsed: parsed,
+										rawType: rawSrc.type || "",
+									});
+								}
 
-									var streamObj = {
-										url: parsed.url,
-										quality: parsed.quality || "Auto",
-										source: parsed.source,
-										dub: parsed.dub || "Original",
-										headers: parsed.headers,
-									};
-									if (baseSubs.length > 0) streamObj.subtitles = baseSubs;
-									streams.push(streamObj);
+								// Phase 2: Validate all URLs in parallel (I/O bound)
+								//   - M3U8/HLS: verify body starts with #EXTM3U (10s timeout)
+								//   - MP4: trust API (can't validate large files)
+								//   - Unknown: try M3U8, then trust API
+								var validationResults = await Promise.all(
+									parsedSources.map(function (entry) {
+										var streamType = entry.rawType;
+										if (streamType === "hls" || streamType === "m3u8") {
+											return checkStreamAlive(entry.parsed.url, "hls", 10000);
+										}
+										// MP4 or unknown: trust the API
+										return checkStreamAlive(
+											entry.parsed.url,
+											streamType || "mp4",
+											10000,
+										);
+									}),
+								);
+
+								// Phase 3: Build final stream list from validated sources
+								var streams = [];
+								var filteredCount = 0;
+								for (var vi = 0; vi < parsedSources.length; vi++) {
+									if (!validationResults[vi]) {
+										filteredCount++;
+										continue;
+									}
+									var p = parsedSources[vi].parsed;
+									streams.push({
+										url: p.url,
+										quality: p.quality || "Auto",
+										source: p.source,
+										dub: p.dub || "Original",
+										headers: p.headers,
+									});
+								}
+
+								if (filteredCount > 0) {
+									log(
+										srv.label +
+											": " +
+											streams.length +
+											"/" +
+											parsedSources.length +
+											" passed validation (" +
+											filteredCount +
+											" filtered)",
+									);
+								}
+
+								if (baseSubs.length > 0) {
+									for (var si = 0; si < streams.length; si++) {
+										streams[si].subtitles = baseSubs;
+									}
 								}
 
 								return {
