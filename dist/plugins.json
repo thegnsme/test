@@ -14,16 +14,6 @@
     "categories": [
       "LiveTv"
     ],
-    "domains": [
-      {
-        "name": "host.cloudplay.me",
-        "url": "https://host.cloudplay.me"
-      },
-      {
-        "name": "mirror1.cloudplay.me",
-        "url": "https://mirror1.cloudplay.me"
-      }
-    ],
     "url": "https://raw.githubusercontent.com/thegnsme/test/repo/dist/com.phisher98.cloudplay.sky"
   },
   {
