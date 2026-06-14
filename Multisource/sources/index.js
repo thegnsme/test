@@ -22,18 +22,8 @@ var TAG = "SourceAggregator";
 var _subtitlesProvider = require("./subtitles_provider");
 
 var _sourceEntries = [
-	["apiplayer_ru", require("./apiplayer_ru")],
-	["ezvidapi", require("./ezvidapi")],
+	
 	["lordflix", require("./lordflix")],
-	["mapple_uk", require("./mapple_uk")],
-	["vidcore_net", require("./vidcore_net")],
-	["videasy_to", require("./videasy_to")],
-	["vidking_net", require("./vidking_net")],
-	["vidlink_pro", require("./vidlink_pro")],
-	["vidsrc", require("./vidsrc")],
-	["vixsrc", require("./vixsrc")],
-	["primesrc", require("./primesrc")],
-	["moflix", require("./moflix")],
 ];
 
 // ─── Build Module Registry ────────────────────────────────────────────
