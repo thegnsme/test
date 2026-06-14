@@ -566,7 +566,7 @@
 	}
 
 	function parseMpdMasterPlaylist(manifestText, manifestUrl) {
-		const variants = [];
+		const adaptationSets = [];
 		const lines = String(manifestText || "").split(/\r?\n/);
 		let currentAdaptationSet = null;
 		let currentRepresentation = null;
@@ -625,14 +625,13 @@
 					currentAdaptationSet &&
 					currentAdaptationSet.representations.length > 0
 				) {
-					variants.push(currentAdaptationSet);
+					adaptationSets.push(currentAdaptationSet);
 				}
 				currentAdaptationSet = null;
 			}
 		});
 
 		// Separate video and audio AdaptationSets
-		var adaptationSets = variants;
 		var videoReps = [];
 		var audioReps = [];
 		for (var asi = 0; asi < adaptationSets.length; asi++) {
@@ -661,20 +660,13 @@
 			}
 		}
 
-		// Build combined video+audio URLs
+		// Build quality variants for video (single RepresentationID each)
 		var result = [];
 		for (var vi = 0; vi < videoReps.length; vi++) {
 			var rep = videoReps[vi];
 			var quality = parseMpdRepresentationQuality(rep);
 			var url = buildMpdVariantPlaybackUrl(rep, manifestUrl);
 			if (url) {
-				// Append audio RepresentationIDs so audio tracks are preserved
-				for (var ai = 0; ai < audioReps.length; ai++) {
-					var audioId = audioReps[ai].id;
-					if (audioId) {
-						url += "&RepresentationID=" + audioId;
-					}
-				}
 				result.push({ url: url, quality: quality });
 			}
 		}
@@ -1395,20 +1387,27 @@
 			var seen = {};
 			var streams = [];
 
+			// Always include the base MPD URL as the primary/default stream
+			// (full manifest with all audio+video AdaptationSets, no filtering)
+			var baseStream = new StreamResult({
+				url: mpdUrl,
+				source: sourceLabel,
+				headers: headers,
+			});
+			if (drmInfo) applyDrmToStream(baseStream, drmInfo);
+			seen[mpdUrl] = true;
+			streams.push(baseStream);
+
+			// Add quality variants on top
 			variants.forEach(function (variant) {
 				if (!variant.url || seen[variant.url]) return;
 				seen[variant.url] = true;
 
 				var r;
 				if (variant.isAudio) {
-					// Audio-only stream — label with language/bandwidth hint
-					var audioLabel = " Audio";
-					if (variant.quality > 0) {
-						audioLabel += " " + variant.quality + "p";
-					}
 					r = new StreamResult({
 						url: variant.url,
-						source: sourceLabel + audioLabel,
+						source: sourceLabel + " Audio",
 						headers: headers,
 					});
 				} else {
